@@ -27,6 +27,22 @@ open dist/Explorer.app
 
 The bundle script builds a release binary, generates a Retina app icon, includes privacy descriptions, and applies an ad-hoc local signature. Distribution signing and notarization are not configured. It does not install or replace Finder.
 
+Install the existing bundle without rebuilding:
+
+```sh
+./scripts/install.sh
+```
+
+The installer verifies the app signature, copies it into `/Applications` (or `~/Applications` when the system Applications directory is not writable), and launches the installed copy. `dist/Install Explorer.command` provides the same installer for a double-click in Finder. The app is self-contained: after bundling, the project's `target/` build cache can be removed while keeping `dist/Explorer.app` and the source.
+
+To create a drag-to-install DMG from the existing bundle:
+
+```sh
+python3 scripts/dmg.py
+```
+
+Open `dist/Explorer-0.3.4-macOS.dmg` and drag Explorer onto Applications. The script verifies the app and image, includes an Applications shortcut, and does not run Cargo or require the build cache.
+
 ## Implemented in the source
 
 - Independent tabs with back/forward history; breadcrumbs, editable paths, `~` expansion, and parent navigation.

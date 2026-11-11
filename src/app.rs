@@ -816,7 +816,7 @@ impl Explorer {
             }
             None => {
                 if detailed {
-                    "Select Calculate folder sizes to measure".into()
+                    "Not calculated".into()
                 } else {
                     "—".into()
                 }
@@ -1144,7 +1144,9 @@ impl Explorer {
         let paths = self.selected();
         match action {
             Action::FolderSizes => {
-                let entries = if all_sizes {
+                let entries = if let Some(Modal::Properties(entries)) = &self.modal {
+                    entries.clone()
+                } else if all_sizes {
                     vec![]
                 } else {
                     self.selected_entries()
@@ -2972,13 +2974,6 @@ impl Explorer {
                 ),
             ],
             MenuKind::Background => vec![
-                (
-                    Action::FolderSizes,
-                    "Calculate folder sizes",
-                    "drive",
-                    "",
-                    true,
-                ),
                 (Action::NewFolder, "New folder", "plus", "⇧⌘N", idle),
                 (Action::NewFile, "New file", "file", "", idle),
                 (Action::Paste, "Paste", "paste", "⌘V", idle),
@@ -2995,13 +2990,6 @@ impl Explorer {
                 (Action::Properties, "Folder properties", "info", "⌘I", true),
             ],
             MenuKind::Selection => vec![
-                (
-                    Action::FolderSizes,
-                    "Calculate folder sizes",
-                    "drive",
-                    "",
-                    true,
-                ),
                 (Action::Open, "Open", "folder", "↵", n > 0),
                 (
                     Action::OpenExternal,
@@ -3240,6 +3228,32 @@ impl Explorer {
                             ),
                             p,
                         ));
+                }
+                if entries.iter().any(|entry| entry.directory) {
+                    content = content.child(
+                        div()
+                            .mt_3()
+                            .flex()
+                            .gap_2()
+                            .child(self.button(
+                                Action::FolderSizes,
+                                "Recalculate size",
+                                "drive",
+                                false,
+                                self.size_worker.is_none(),
+                                cx,
+                            ))
+                            .when(self.size_worker.is_some(), |d| {
+                                d.child(self.button(
+                                    Action::CancelSizes,
+                                    "Cancel",
+                                    "close",
+                                    false,
+                                    true,
+                                    cx,
+                                ))
+                            }),
+                    );
                 }
             }
             Modal::Help => {

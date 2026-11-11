@@ -2,7 +2,7 @@
 
 A native Rust + GPUI file manager with a Windows 11 Explorer-style interface: neutral surfaces, compact tabs and command bar, yellow folder icons, a navigation tree, details/grid views, and an optional preview pane. GPUI renders the interface directly; there is no browser or webview.
 
-**Status: initial implementation.** The full GPUI application passes `cargo check --all-targets` and builds in release mode. The 72 core/native-operation tests and 31 rendered GPUI event tests pass, and the signed app bundle is generated at `dist/Explorer.app`. The live input log exposed a 150 ms macOS double-click setting rejecting recorded 167–200 ms click pairs; replaying the timing in a rendered test reproduced the failure. Version 0.3.3 adds a 500 ms application minimum while preserving slower system preferences. Live confirmation of the new build is pending. Full Windows Explorer/Finder feature parity is not claimed.
+**Status: initial implementation.** The full GPUI application passes `cargo check --all-targets` and builds in release mode. The 72 core/native-operation tests and 31 rendered GPUI event tests pass, and the signed app bundle is generated at `dist/Explorer.app`. The live input log exposed a 150 ms macOS double-click setting rejecting recorded 167–200 ms click pairs; replaying the timing in a rendered test reproduced the failure. Version 0.3.3 adds a 500 ms application minimum while preserving slower system preferences. The running 0.3.3 app's log subsequently confirmed folder activation and navigation from paired presses reported as single clicks. Full Windows Explorer/Finder feature parity is not claimed.
 
 ## Run
 

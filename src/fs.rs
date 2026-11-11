@@ -1,0 +1,824 @@
+#[cfg(unix)]
+use std::os::unix::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, PermissionsExt, symlink},
+};
+use std::{
+    cmp::Ordering,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub path: PathBuf,
+    pub name: String,
+    pub directory: bool,
+    pub symlink: bool,
+    pub application: bool,
+    pub bytes: u64,
+    pub modified: SystemTime,
+    pub created: Option<SystemTime>,
+    pub readonly: bool,
+    pub mode: u32,
+    pub kind: String,
+}
+impl Entry {
+    pub fn read(path: PathBuf) -> io::Result<Self> {
+        let link = fs::symlink_metadata(&path)?;
+        let metadata = if link.is_symlink() {
+            fs::metadata(&path).unwrap_or_else(|_| link.clone())
+        } else {
+            link.clone()
+        };
+        let directory = metadata.is_dir();
+        let ext = path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        let application = directory
+            && if link.is_symlink() {
+                fs::canonicalize(&path)
+                    .ok()
+                    .and_then(|p| p.extension().map(|e| e.eq_ignore_ascii_case("app")))
+                    .unwrap_or(false)
+            } else {
+                ext == "app"
+            };
+        let kind = if link.is_symlink() {
+            "Symbolic link".into()
+        } else if application {
+            "Application".into()
+        } else if directory {
+            "Folder".into()
+        } else {
+            match ext.as_str() {
+                "jpg" | "jpeg" | "png" | "heic" | "gif" | "webp" | "tiff" | "svg" => "Image".into(),
+                "mp4" | "mov" | "mkv" | "webm" => "Video".into(),
+                "mp3" | "wav" | "m4a" | "flac" | "aiff" => "Audio".into(),
+                "zip" | "tar" | "gz" | "7z" | "rar" => "Archive".into(),
+                "pdf" => "PDF document".into(),
+                "rs" | "js" | "ts" | "tsx" | "py" | "swift" | "go" | "html" | "css" | "json"
+                | "toml" | "yaml" => "Source code".into(),
+                "txt" | "md" | "log" | "csv" => "Text document".into(),
+                "" => "File".into(),
+                _ => format!("{} file", ext.to_uppercase()),
+            }
+        };
+        Ok(Self {
+            name: path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            path,
+            directory,
+            symlink: link.is_symlink(),
+            application,
+            bytes: metadata.len(),
+            modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+            created: metadata.created().ok(),
+            readonly: metadata.permissions().readonly(),
+            mode: metadata.permissions().mode(),
+            kind,
+        })
+    }
+    pub fn navigable(&self) -> bool {
+        self.directory && !self.application
+    }
+    /// Listing keeps broken links visible; opening requires a reachable target.
+    pub fn read_for_open(path: PathBuf) -> io::Result<Self> {
+        fs::metadata(&path)?;
+        Self::read(path)
+    }
+    pub fn icon(&self) -> &'static str {
+        if self.symlink {
+            "link"
+        } else if self.directory {
+            "folder"
+        } else {
+            match self.kind.as_str() {
+                "Image" => "image",
+                "Video" => "video",
+                "Audio" => "music",
+                "Archive" => "archive",
+                "Source code" => "code",
+                _ => "file",
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Sort {
+    #[default]
+    Name,
+    Modified,
+    Kind,
+    Size,
+}
+pub fn sort(entries: &mut [Entry], key: Sort, descending: bool) {
+    entries.sort_by(|a, b| {
+        let grouping = b.directory.cmp(&a.directory);
+        if grouping != Ordering::Equal {
+            return grouping;
+        }
+        let order = match key {
+            Sort::Name => natural_cmp(&a.name.to_lowercase(), &b.name.to_lowercase()),
+            Sort::Modified => a.modified.cmp(&b.modified),
+            Sort::Kind => a.kind.cmp(&b.kind),
+            Sort::Size => a.bytes.cmp(&b.bytes),
+        }
+        .then_with(|| natural_cmp(&a.name.to_lowercase(), &b.name.to_lowercase()))
+        .then_with(|| a.path.cmp(&b.path));
+        if descending { order.reverse() } else { order }
+    });
+}
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let x: String = std::iter::from_fn(|| {
+                    a.peek()
+                        .copied()
+                        .filter(char::is_ascii_digit)
+                        .map(|_| a.next().unwrap())
+                })
+                .collect();
+                let y: String = std::iter::from_fn(|| {
+                    b.peek()
+                        .copied()
+                        .filter(char::is_ascii_digit)
+                        .map(|_| b.next().unwrap())
+                })
+                .collect();
+                let (nx, ny) = (x.trim_start_matches('0'), y.trim_start_matches('0'));
+                let c = nx
+                    .len()
+                    .cmp(&ny.len())
+                    .then_with(|| nx.cmp(ny))
+                    .then_with(|| x.len().cmp(&y.len()));
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            (Some(_), Some(_)) => {
+                let c = a.next().cmp(&b.next());
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            _ => return a.next().cmp(&b.next()),
+        }
+    }
+}
+#[derive(Debug, Default)]
+pub struct Listing {
+    pub entries: Vec<Entry>,
+    pub skipped: usize,
+    pub truncated: bool,
+}
+pub fn list(path: &Path, hidden: bool, cancel: &AtomicBool) -> io::Result<Listing> {
+    let mut result = Listing::default();
+    for item in fs::read_dir(path)? {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+        match item {
+            Ok(item) => {
+                if !hidden && item.file_name().as_bytes().first() == Some(&b'.') {
+                    continue;
+                }
+                match Entry::read(item.path()) {
+                    Ok(entry) => result.entries.push(entry),
+                    Err(_) => result.skipped += 1,
+                }
+            }
+            Err(_) => result.skipped += 1,
+        }
+    }
+    Ok(result)
+}
+pub fn search(root: &Path, query: &str, hidden: bool, cancel: &AtomicBool) -> io::Result<Listing> {
+    // Do not traverse directory symlinks: this prevents loops and escaping the search root.
+    let mut stack = vec![root.to_path_buf()];
+    let mut result = Listing::default();
+    let query = query.to_lowercase();
+    fs::read_dir(root)?;
+    while let Some(path) = stack.pop() {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+        match list(&path, hidden, cancel) {
+            Ok(listing) => {
+                result.skipped += listing.skipped;
+                for entry in listing.entries {
+                    if cancel.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    if entry.navigable() && !entry.symlink {
+                        stack.push(entry.path.clone());
+                    }
+                    if entry.name.to_lowercase().contains(&query) {
+                        result.entries.push(entry);
+                        if result.entries.len() >= 10_000 {
+                            result.truncated = true;
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
+            Err(_) => result.skipped += 1,
+        }
+    }
+    Ok(result)
+}
+pub fn validate_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\0')
+        || name.contains(':')
+    {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Enter a name without /, : or null characters.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+pub fn create(parent: &Path, name: &str, directory: bool) -> io::Result<PathBuf> {
+    validate_name(name)?;
+    let path = parent.join(name);
+    if directory {
+        fs::create_dir(&path)?;
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+    }
+    Ok(path)
+}
+pub fn unique_path(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let path = parent.join(name);
+    if fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+        return path;
+    }
+    let p = Path::new(name);
+    let stem = p.file_stem().unwrap_or(name).to_string_lossy();
+    let ext = p
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1.. {
+        let candidate = parent.join(if n == 1 {
+            format!("{stem} copy{ext}")
+        } else {
+            format!("{stem} copy {n}{ext}")
+        });
+        if fs::symlink_metadata(&candidate).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+#[cfg(target_os = "macos")]
+pub fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const std::ffi::c_char,
+            to: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let from = CString::new(from.as_os_str().as_bytes())?;
+    let to = CString::new(to.as_os_str().as_bytes())?;
+    // RENAME_EXCL is atomic even when another process creates the destination.
+    if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), 4) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+#[cfg(not(target_os = "macos"))]
+pub fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(to).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Destination already exists",
+        ));
+    }
+    fs::rename(from, to)
+}
+pub fn rename(path: &Path, name: &str) -> io::Result<PathBuf> {
+    validate_name(name)?;
+    let target = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Cannot rename the filesystem root"))?
+        .join(name);
+    if path != target {
+        rename_exclusive(path, &target)?;
+    }
+    Ok(target)
+}
+fn cancelled(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel.load(AtomicOrdering::Relaxed) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Operation cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+fn validate_transfer(from: &Path, to: &Path) -> io::Result<()> {
+    let source = fs::canonicalize(from).or_else(|e| {
+        if fs::symlink_metadata(from)?.is_symlink() {
+            Ok(from.to_path_buf())
+        } else {
+            Err(e)
+        }
+    })?;
+    let target = fs::canonicalize(
+        to.parent()
+            .ok_or_else(|| io::Error::other("Missing destination parent"))?,
+    )?
+    .join(
+        to.file_name()
+            .ok_or_else(|| io::Error::other("Missing destination name"))?,
+    );
+    if source == target || (fs::symlink_metadata(from)?.is_dir() && target.starts_with(&source)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "A folder cannot be copied or moved into itself.",
+        ));
+    }
+    Ok(())
+}
+fn remove_created(path: &Path) {
+    if let Ok(m) = fs::symlink_metadata(path) {
+        if m.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+fn copy_inner(
+    from: &Path,
+    to: &Path,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(u64),
+) -> io::Result<()> {
+    cancelled(cancel)?;
+    let meta = fs::symlink_metadata(from)?;
+    if meta.is_symlink() {
+        symlink(fs::read_link(from)?, to)?;
+        return Ok(());
+    }
+    if meta.is_dir() {
+        fs::create_dir(to)?;
+        let result = (|| {
+            for item in fs::read_dir(from)? {
+                let item = item?;
+                copy_inner(&item.path(), &to.join(item.file_name()), cancel, progress)?;
+            }
+            fs::set_permissions(to, meta.permissions())?;
+            Ok(())
+        })();
+        if result.is_err() {
+            remove_created(to);
+        }
+        result
+    } else if meta.is_file() {
+        let mut source = File::open(from)?;
+        let mut dest = OpenOptions::new().write(true).create_new(true).open(to)?;
+        let result = (|| {
+            let mut buf = vec![0u8; 1024 * 1024];
+            loop {
+                cancelled(cancel)?;
+                let n = source.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                dest.write_all(&buf[..n])?;
+                progress(n as u64);
+            }
+            dest.sync_all()?;
+            fs::set_permissions(to, meta.permissions())?;
+            // Retain timestamps without adding an external dependency.
+            let times = fs::FileTimes::new().set_modified(meta.modified()?);
+            dest.set_times(times)?;
+            Ok(())
+        })();
+        drop(dest);
+        if result.is_err() {
+            remove_created(to);
+        }
+        result
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Sockets, devices and named pipes are not copied.",
+        ))
+    }
+}
+pub fn copy(
+    from: &Path,
+    to: &Path,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> io::Result<()> {
+    validate_transfer(from, to)?;
+    copy_inner(from, to, cancel, &mut progress)
+}
+pub fn move_item(
+    from: &Path,
+    to: &Path,
+    cancel: &AtomicBool,
+    progress: impl FnMut(u64),
+) -> io::Result<()> {
+    validate_transfer(from, to)?;
+    cancelled(cancel)?;
+    match rename_exclusive(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(18) => {
+            copy(from, to, cancel, progress)?;
+            // A completed cross-volume copy is preserved if deleting the source fails.
+            if fs::symlink_metadata(from)?.is_dir() {
+                fs::remove_dir_all(from)
+            } else {
+                fs::remove_file(from)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    dev: u64,
+    ino: u64,
+}
+impl Identity {
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let m = fs::symlink_metadata(path)?;
+        Ok(Self {
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+    pub fn matches(&self, path: &Path) -> bool {
+        Self::read(path).is_ok_and(|id| id == *self)
+    }
+}
+#[derive(Clone, Debug)]
+pub struct Change {
+    pub original: Option<PathBuf>,
+    pub current: PathBuf,
+    pub identity: Identity,
+}
+impl Change {
+    pub fn created(path: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            identity: Identity::read(&path)?,
+            original: None,
+            current: path,
+        })
+    }
+    pub fn moved(from: PathBuf, to: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            identity: Identity::read(&to)?,
+            original: Some(from),
+            current: to,
+        })
+    }
+}
+
+pub fn preview_text(path: &Path) -> io::Result<String> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::other(
+            "Select a regular file for a text preview.",
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?.take(32 * 1024).read_to_end(&mut bytes)?;
+    if bytes.contains(&0) {
+        return Err(io::Error::other("Binary file · press Space for Quick Look"));
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if fs::metadata(path)?.len() > bytes.len() as u64 {
+        text.push_str("\n\n… Preview limited to 32 KB. Open the file to read more.");
+    }
+    Ok(text)
+}
+pub fn human_size(bytes: u64) -> String {
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    for unit in ["KB", "MB", "GB", "TB", "PB"] {
+        value /= 1000.;
+        if value < 1000. || unit == "PB" {
+            return format!("{value:.1} {unit}");
+        }
+    }
+    unreachable!()
+}
+pub fn date(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs / 86400;
+    // Gregorian date from Unix days (UTC), valid for the full UI date range.
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    y += i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        secs % 86400 / 3600,
+        secs % 3600 / 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "explorer-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+            ));
+            fs::create_dir(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self, p: &str) -> PathBuf {
+            self.0.join(p)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn no() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+    #[test]
+    fn create_never_truncates_existing_file() {
+        let f = Fixture::new();
+        fs::write(f.path("a"), "keep").unwrap();
+        assert!(create(&f.0, "a", false).is_err());
+        assert_eq!(fs::read_to_string(f.path("a")).unwrap(), "keep");
+    }
+    #[test]
+    fn names_reject_traversal_and_root() {
+        for s in ["", ".", "..", "a/b", "a\0b", "a:b"] {
+            assert!(validate_name(s).is_err());
+        }
+        assert!(validate_name("photo 你好.txt").is_ok());
+    }
+    #[test]
+    fn listing_filters_hidden() {
+        let f = Fixture::new();
+        create(&f.0, ".hidden", false).unwrap();
+        create(&f.0, "visible", false).unwrap();
+        assert_eq!(list(&f.0, false, &no()).unwrap().entries.len(), 1);
+        assert_eq!(list(&f.0, true, &no()).unwrap().entries.len(), 2);
+    }
+    #[test]
+    fn sort_naturally_keeps_folders_first() {
+        let f = Fixture::new();
+        for n in ["file10", "file2", "file1"] {
+            create(&f.0, n, false).unwrap();
+        }
+        create(&f.0, "z-folder", true).unwrap();
+        let mut e = list(&f.0, false, &no()).unwrap().entries;
+        sort(&mut e, Sort::Name, false);
+        assert_eq!(
+            e.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["z-folder", "file1", "file2", "file10"]
+        );
+        sort(&mut e, Sort::Name, true);
+        assert_eq!(e[0].name, "z-folder");
+        assert_eq!(e[1].name, "file10");
+    }
+    #[test]
+    fn copy_tree_and_progress() {
+        let f = Fixture::new();
+        let a = create(&f.0, "a", true).unwrap();
+        fs::write(a.join("file"), "contents").unwrap();
+        let mut bytes = 0;
+        copy(&a, &f.path("b"), &no(), |n| bytes += n).unwrap();
+        assert_eq!(bytes, 8);
+        assert_eq!(fs::read_to_string(f.path("b/file")).unwrap(), "contents");
+        assert!(a.exists());
+    }
+    #[test]
+    fn copy_does_not_overwrite() {
+        let f = Fixture::new();
+        fs::write(f.path("a"), "new").unwrap();
+        fs::write(f.path("b"), "old").unwrap();
+        assert!(copy(&f.path("a"), &f.path("b"), &no(), |_| {}).is_err());
+        assert_eq!(fs::read_to_string(f.path("b")).unwrap(), "old");
+    }
+    #[test]
+    fn copy_does_not_merge_folders() {
+        let f = Fixture::new();
+        create(&f.0, "a", true).unwrap();
+        create(&f.0, "b", true).unwrap();
+        fs::write(f.path("b/keep"), "old").unwrap();
+        assert!(copy(&f.path("a"), &f.path("b"), &no(), |_| {}).is_err());
+        assert!(f.path("b/keep").exists());
+    }
+    #[test]
+    fn copy_rejects_self_and_descendants() {
+        let f = Fixture::new();
+        let a = create(&f.0, "a", true).unwrap();
+        assert!(copy(&a, &a, &no(), |_| {}).is_err());
+        assert!(copy(&a, &a.join("nested"), &no(), |_| {}).is_err());
+        assert!(!a.join("nested").exists());
+    }
+    #[test]
+    fn copy_rejects_symlinked_descendants() {
+        let f = Fixture::new();
+        let a = create(&f.0, "a", true).unwrap();
+        symlink(&a, f.path("alias")).unwrap();
+        assert!(copy(&a, &f.path("alias/nested"), &no(), |_| {}).is_err());
+    }
+    #[test]
+    fn cancelled_copy_preserves_source() {
+        let f = Fixture::new();
+        fs::write(f.path("a"), "source").unwrap();
+        assert!(copy(&f.path("a"), &f.path("b"), &AtomicBool::new(true), |_| {}).is_err());
+        assert!(!f.path("b").exists());
+        assert!(f.path("a").exists());
+    }
+    #[test]
+    fn partial_cancel_removes_only_new_destination() {
+        let f = Fixture::new();
+        fs::write(f.path("a"), vec![1u8; 3 * 1024 * 1024]).unwrap();
+        let cancel = no();
+        assert!(
+            copy(&f.path("a"), &f.path("b"), &cancel, |_| cancel
+                .store(true, AtomicOrdering::Relaxed))
+            .is_err()
+        );
+        assert!(!f.path("b").exists());
+        assert_eq!(fs::metadata(f.path("a")).unwrap().len(), 3 * 1024 * 1024);
+    }
+    #[test]
+    fn symlinks_are_copied_without_following() {
+        let f = Fixture::new();
+        symlink("missing", f.path("link")).unwrap();
+        copy(&f.path("link"), &f.path("copied"), &no(), |_| {}).unwrap();
+        assert_eq!(
+            fs::read_link(f.path("copied")).unwrap(),
+            Path::new("missing")
+        );
+    }
+    #[test]
+    fn move_is_exclusive() {
+        let f = Fixture::new();
+        fs::write(f.path("a"), "a").unwrap();
+        fs::write(f.path("b"), "b").unwrap();
+        assert!(move_item(&f.path("a"), &f.path("b"), &no(), |_| {}).is_err());
+        assert_eq!(fs::read_to_string(f.path("a")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(f.path("b")).unwrap(), "b");
+    }
+    #[test]
+    fn successful_move_and_identity() {
+        let f = Fixture::new();
+        fs::write(f.path("a"), "a").unwrap();
+        let id = Identity::read(&f.path("a")).unwrap();
+        move_item(&f.path("a"), &f.path("b"), &no(), |_| {}).unwrap();
+        assert!(!f.path("a").exists());
+        assert!(id.matches(&f.path("b")));
+    }
+    #[test]
+    fn rename_is_exclusive() {
+        let f = Fixture::new();
+        create(&f.0, "a", false).unwrap();
+        create(&f.0, "b", false).unwrap();
+        assert!(rename(&f.path("a"), "b").is_err());
+        assert!(f.path("a").exists());
+    }
+    #[test]
+    fn unique_names_respect_extensions_and_dangling_links() {
+        let f = Fixture::new();
+        symlink("missing", f.path("a.txt")).unwrap();
+        assert_eq!(
+            unique_path(&f.0, std::ffi::OsStr::new("a.txt")),
+            f.path("a copy.txt")
+        );
+        create(&f.0, "a copy.txt", false).unwrap();
+        assert_eq!(
+            unique_path(&f.0, std::ffi::OsStr::new("a.txt")),
+            f.path("a copy 2.txt")
+        );
+    }
+    #[test]
+    fn search_is_recursive_case_insensitive_and_skips_link_loops() {
+        let f = Fixture::new();
+        create(&f.0, "nested", true).unwrap();
+        create(&f.path("nested"), "Report.txt", false).unwrap();
+        symlink(&f.0, f.path("nested/loop")).unwrap();
+        let r = search(&f.0, "report", false, &no()).unwrap();
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].name, "Report.txt");
+    }
+    #[test]
+    fn search_respects_hidden() {
+        let f = Fixture::new();
+        create(&f.0, ".hidden", true).unwrap();
+        create(&f.path(".hidden"), "match", false).unwrap();
+        assert!(
+            search(&f.0, "match", false, &no())
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert_eq!(search(&f.0, "match", true, &no()).unwrap().entries.len(), 1);
+    }
+    #[test]
+    fn preview_bounds_reads_and_detects_binary() {
+        let f = Fixture::new();
+        fs::write(f.path("a"), "x".repeat(40000)).unwrap();
+        assert!(preview_text(&f.path("a")).unwrap().len() < 34000);
+        fs::write(f.path("b"), [1, 0, 2]).unwrap();
+        assert!(preview_text(&f.path("b")).is_err());
+    }
+    #[test]
+    fn formats_sizes_and_dates() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1500), "1.5 KB");
+        assert_eq!(date(UNIX_EPOCH), "1970-01-01 00:00");
+        assert_eq!(
+            date(UNIX_EPOCH + std::time::Duration::from_secs(1709164800)),
+            "2024-02-29 00:00"
+        );
+    }
+    #[test]
+    fn directory_symlinks_open_and_list_their_target_contents() {
+        let f = Fixture::new();
+        let target = create(&f.0, "target", true).unwrap();
+        fs::write(target.join("inside.txt"), "inside").unwrap();
+        symlink("target", f.path("folder link")).unwrap();
+        let entry = Entry::read_for_open(f.path("folder link")).unwrap();
+        assert!(entry.symlink && entry.navigable());
+        let listing = list(&entry.path, false, &no()).unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].path, f.path("folder link/inside.txt"));
+    }
+    #[test]
+    fn file_symlinks_are_opened_as_files() {
+        let f = Fixture::new();
+        fs::write(f.path("target.txt"), "contents").unwrap();
+        symlink("target.txt", f.path("file link")).unwrap();
+        let entry = Entry::read_for_open(f.path("file link")).unwrap();
+        assert!(entry.symlink);
+        assert!(!entry.navigable());
+        assert_eq!(entry.bytes, 8);
+    }
+    #[test]
+    fn broken_links_remain_visible_but_open_reports_missing_target() {
+        let f = Fixture::new();
+        symlink("missing", f.path("broken")).unwrap();
+        assert!(Entry::read(f.path("broken")).unwrap().symlink);
+        assert_eq!(
+            Entry::read_for_open(f.path("broken")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+    #[test]
+    fn links_to_application_bundles_are_launched_instead_of_browsed() {
+        let f = Fixture::new();
+        create(&f.0, "Example.APP", true).unwrap();
+        symlink("Example.APP", f.path("app link")).unwrap();
+        let entry = Entry::read_for_open(f.path("app link")).unwrap();
+        assert!(entry.symlink && entry.application);
+        assert!(!entry.navigable());
+    }
+}

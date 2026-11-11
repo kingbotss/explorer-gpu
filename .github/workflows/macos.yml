@@ -1,0 +1,25 @@
+name: macOS
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+      - name: Filesystem and native operation tests
+        run: ./scripts/test-offline.sh
+      - name: Rendered GPUI event tests
+        run: ./scripts/test-ui.sh
+      - name: Build app bundle
+        run: ./scripts/bundle.sh
+      - name: Archive app with executable permissions
+        run: ditto -c -k --sequesterRsrc --keepParent dist/Explorer.app dist/Explorer-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Explorer-macos
+          path: dist/Explorer-macos.zip

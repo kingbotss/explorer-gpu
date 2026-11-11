@@ -1,0 +1,12 @@
+[package]
+name = "explorer-ui-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[workspace]
+[lib]
+path = "harness.rs"
+[dependencies]
+gpui = { version = "=0.2.2", features = ["runtime_shaders", "test-support"] }
+explorer = { path = "../.." }
+anyhow = "1"

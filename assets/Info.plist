@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>Explorer</string>
+<key>CFBundleDisplayName</key><string>Explorer</string>
+<key>CFBundleIdentifier</key><string>com.explorer.mac</string>
+<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleExecutable</key><string>Explorer</string>
+<key>CFBundleIconFile</key><string>Explorer.icns</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>NSPrincipalClass</key><string>NSApplication</string>
+<key>NSHighResolutionCapable</key><true/>
+<key>LSMinimumSystemVersion</key><string>12.0</string>
+<key>NSDocumentsFolderUsageDescription</key><string>Explorer browses and manages files you choose in Documents.</string>
+<key>NSDesktopFolderUsageDescription</key><string>Explorer browses and manages files you choose on the Desktop.</string>
+<key>NSDownloadsFolderUsageDescription</key><string>Explorer browses and manages files you choose in Downloads.</string>
+<key>NSRemovableVolumesUsageDescription</key><string>Explorer browses and manages files on your mounted external drives.</string>
+<key>NSNetworkVolumesUsageDescription</key><string>Explorer browses and manages files on your mounted network drives.</string>
+</dict></plist>

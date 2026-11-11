@@ -1,0 +1,9 @@
+/target/
+/dist/
+.DS_Store
+
+/tests/gpui/Cargo.lock
+/tests/gpui/target/
+
+__pycache__/
+*.py[cod]

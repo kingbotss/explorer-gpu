@@ -101,6 +101,26 @@ impl Fixture {
         self.visual
             .read(|cx| assert_eq!(self.view.read(cx).tab().path, self.expected));
     }
+    fn finish_sizes(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let view = self.view.clone();
+            let done = self.visual.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    view.poll(cx);
+                    view.size_worker.is_none()
+                })
+            });
+            if done {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "folder size worker timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
     fn menu_click(&mut self, command: &'static str, item: &'static str) {
         let p = self.point(command);
         self.click(p, Modifiers::none(), 1, false);
@@ -119,6 +139,108 @@ fn list_native_double_click_opens(cx: &mut TestAppContext) {
     let mut f = Fixture::new(cx, false, false);
     f.double(Modifiers::none(), true, false);
     f.assert_open();
+}
+#[gpui::test]
+fn two_captured_presses_open_even_without_click_completions_or_native_counts(
+    cx: &mut TestAppContext,
+) {
+    let mut f = Fixture::new(cx, false, false);
+    let p = f.point("first-file-row");
+    f.visual.simulate_mouse_move(p, None, Modifiers::none());
+    for _ in 0..2 {
+        f.visual.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: p,
+            modifiers: Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+    }
+    f.assert_open();
+}
+#[gpui::test]
+fn icon_then_filename_presses_open_the_same_selected_folder(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    f.select_then_finish_sequence();
+    let p = f.point("first-file-row");
+    f.click(p, Modifiers::none(), 1, false);
+    f.click(p + point(px(120.), px(0.)), Modifiers::none(), 1, false);
+    f.assert_open();
+}
+#[gpui::test]
+fn selecting_a_folder_calculates_nested_size_in_the_background(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    std::fs::create_dir(f.expected.join("nested")).unwrap();
+    std::fs::write(f.expected.join("nested/file"), [0; 4500]).unwrap();
+    std::fs::write(f.expected.join(".hidden"), [0; 100]).unwrap();
+    let p = f.point("first-file-row");
+    f.click(p, Modifiers::none(), 1, false);
+    f.finish_sizes();
+    f.visual.read(|cx| {
+        let view = f.view.read(cx);
+        let entry = &view.tab().entries[0];
+        assert_eq!(view.entry_bytes(entry), Some(4600));
+        assert!(view.size_label(entry, true).contains("4600 bytes"));
+        assert!(view.size_label(entry, true).contains("2 files, 1 folders"));
+        assert_eq!(view.tab().path, f.path);
+    });
+}
+#[gpui::test]
+fn size_sort_measures_folders_and_uses_content_bytes(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    std::fs::write(f.expected.join("large"), [0; 500]).unwrap();
+    let smaller = f.path.join("z-smaller");
+    std::fs::create_dir(&smaller).unwrap();
+    std::fs::write(smaller.join("small"), [0; 10]).unwrap();
+    let view = f.view.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tab_mut()
+                .entries
+                .push(Entry::read(smaller.clone()).unwrap());
+            view.rebuild(cx);
+        })
+    });
+    f.menu_click("command-Sort", "menu-sort-size");
+    f.finish_sizes();
+    // Let the click interval expire before the deferred re-sort moves rows.
+    let view = f.view.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.clicks.clear();
+            view.poll(cx);
+        })
+    });
+    f.visual.read(|cx| {
+        let view = f.view.read(cx);
+        assert_eq!(view.tab().entries[0].path, smaller);
+        assert_eq!(view.entry_bytes(&view.tab().entries[1]), Some(500));
+    });
+}
+#[gpui::test]
+fn cancelling_folder_size_ignores_worker_results_from_the_previous_generation(
+    cx: &mut TestAppContext,
+) {
+    let mut f = Fixture::new(cx, false, false);
+    let view = f.view.clone();
+    let path = f.expected.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.request_sizes(vec![path.clone()], true);
+            let generation = view.size_generation;
+            view.cancel_sizes();
+            view.tx
+                .send(super::Message::FolderSize {
+                    generation,
+                    path: path.clone(),
+                    result: Ok(Default::default()),
+                })
+                .unwrap();
+            view.poll(cx);
+            assert!(!view.folder_sizes.contains_key(&path));
+            assert!(view.size_worker.is_none());
+        })
+    });
 }
 #[gpui::test]
 fn native_second_press_opens_before_a_lost_release(cx: &mut TestAppContext) {

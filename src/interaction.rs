@@ -16,6 +16,7 @@ struct PointerPress {
 
 pub struct RowClicks {
     last: Option<Press>,
+    down: Option<Press>,
     pointer: Option<PointerPress>,
     activated_press: Option<(usize, PathBuf)>,
     interval: Duration,
@@ -29,6 +30,7 @@ impl RowClicks {
     pub fn new(interval: Duration) -> Self {
         Self {
             last: None,
+            down: None,
             pointer: None,
             activated_press: None,
             interval,
@@ -36,6 +38,7 @@ impl RowClicks {
     }
     pub fn clear(&mut self) {
         self.last = None;
+        self.down = None;
         self.pointer = None;
         self.activated_press = None;
     }
@@ -44,6 +47,10 @@ impl RowClicks {
     }
     pub fn is_interacting(&self, now: Instant) -> bool {
         self.pointer.is_some()
+            || self
+                .down
+                .as_ref()
+                .is_some_and(|last| now.saturating_duration_since(last.time) <= self.interval)
             || self
                 .last
                 .as_ref()
@@ -66,6 +73,7 @@ impl RowClicks {
         }
         pointer.dragging = true;
         self.last = None;
+        self.down = None;
         false
     }
     pub fn begin_press(&mut self, position: (f32, f32)) {
@@ -86,8 +94,35 @@ impl RowClicks {
             return false;
         }
         self.last = None;
+        self.down = None;
         self.activated_press = Some((tab, path.to_path_buf()));
         true
+    }
+    /// Count presses independently of GPUI's completed-click/drag state. Some
+    /// synthetic input reports every native click count as one.
+    pub fn press(&mut self, tab: usize, path: &Path, now: Instant, count: usize) -> bool {
+        let timed = self.down.as_ref().is_some_and(|last| {
+            last.tab == tab
+                && last.path == path
+                && now.saturating_duration_since(last.time) <= self.interval
+        });
+        let same_press_target = self
+            .down
+            .as_ref()
+            .is_none_or(|last| last.tab == tab && last.path == path);
+        if (same_press_target && self.native_press(tab, path, count)) || timed {
+            self.last = None;
+            self.down = None;
+            self.activated_press = Some((tab, path.to_path_buf()));
+            true
+        } else {
+            self.down = Some(Press {
+                tab,
+                path: path.to_path_buf(),
+                time: now,
+            });
+            false
+        }
     }
     pub fn consume_native_release(&mut self, tab: usize, path: &Path) -> bool {
         let consumed = self
@@ -134,6 +169,15 @@ mod tests {
     use super::*;
     fn path() -> &'static Path {
         Path::new("/tmp/folder")
+    }
+    #[test]
+    fn captured_press_pairs_cannot_cross_paths_or_tabs_when_releases_are_lost() {
+        let mut clicks = RowClicks::default();
+        let now = Instant::now();
+        assert!(!clicks.press(1, path(), now, 1));
+        assert!(!clicks.press(1, Path::new("/tmp/other"), now, 2));
+        assert!(!clicks.press(2, Path::new("/tmp/other"), now, 2));
+        assert!(clicks.press(2, Path::new("/tmp/other"), now, 1));
     }
     #[test]
     fn native_press_is_consumed_before_release_and_triple_click() {
@@ -249,6 +293,15 @@ mod tests {
         clicks.release();
         clicks.complete(1, path(), now, 1);
         assert!(clicks.is_interacting(now + Duration::from_millis(200)));
+        assert!(!clicks.is_interacting(now + Duration::from_millis(600)));
+        clicks.clear();
+        clicks.begin_press((20., 20.));
+        clicks.press(1, path(), now, 1);
+        clicks.release();
+        assert!(
+            clicks.is_interacting(now + Duration::from_millis(200)),
+            "a lost click completion must still defer refresh"
+        );
         assert!(!clicks.is_interacting(now + Duration::from_millis(600)));
     }
     #[test]

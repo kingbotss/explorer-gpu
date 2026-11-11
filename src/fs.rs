@@ -183,6 +183,77 @@ pub struct Listing {
     pub skipped: usize,
     pub truncated: bool,
 }
+#[derive(Clone, Debug, Default)]
+pub struct FolderSize {
+    pub bytes: u64,
+    pub files: u64,
+    pub folders: u64,
+    pub links: u64,
+    pub skipped: u64,
+}
+/// Logical content size. Resolve a selected root link, but never traverse links
+/// inside it. Include hidden files and count link lengths rather than targets.
+pub fn folder_size(root: &Path, cancel: &AtomicBool) -> io::Result<FolderSize> {
+    let root = fs::canonicalize(root)?;
+    if !fs::metadata(&root)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "Expected a folder",
+        ));
+    }
+    let mut size = FolderSize::default();
+    let mut stack = vec![root.clone()];
+    while let Some(path) = stack.pop() {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Size calculation cancelled",
+            ));
+        }
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if path == root => {
+                return Err(error);
+            }
+            Err(_) => {
+                size.skipped += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            if cancel.load(AtomicOrdering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Size calculation cancelled",
+                ));
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    size.skipped += 1;
+                    continue;
+                }
+            };
+            match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) if metadata.is_symlink() => {
+                    size.links += 1;
+                    size.bytes = size.bytes.saturating_add(metadata.len());
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    size.folders += 1;
+                    stack.push(entry.path());
+                }
+                Ok(metadata) if metadata.is_file() => {
+                    size.files += 1;
+                    size.bytes = size.bytes.saturating_add(metadata.len());
+                }
+                Ok(_) => {}
+                Err(_) => size.skipped += 1,
+            }
+        }
+    }
+    Ok(size)
+}
 pub fn list(path: &Path, hidden: bool, cancel: &AtomicBool) -> io::Result<Listing> {
     let mut result = Listing::default();
     for item in fs::read_dir(path)? {
@@ -585,6 +656,72 @@ mod tests {
     }
     fn no() -> AtomicBool {
         AtomicBool::new(false)
+    }
+    #[test]
+    fn folder_size_includes_nested_and_hidden_files() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.path("nested/empty")).unwrap();
+        fs::write(f.path("a"), [0; 123]).unwrap();
+        fs::write(f.path("nested/.hidden"), [0; 456]).unwrap();
+        let size = folder_size(&f.0, &no()).unwrap();
+        assert_eq!(
+            (
+                size.bytes,
+                size.files,
+                size.folders,
+                size.links,
+                size.skipped
+            ),
+            (579, 2, 2, 0, 0)
+        );
+    }
+    #[test]
+    fn folder_size_never_traverses_internal_symlinks_and_can_size_a_root_link() {
+        let f = Fixture::new();
+        fs::create_dir(f.path("root")).unwrap();
+        fs::create_dir(f.path("outside")).unwrap();
+        fs::write(f.path("outside/large"), [0; 5000]).unwrap();
+        fs::write(f.path("root/file"), [0; 10]).unwrap();
+        symlink(".", f.path("root/loop")).unwrap();
+        symlink("../outside", f.path("root/link")).unwrap();
+        symlink("root", f.path("root link")).unwrap();
+        let size = folder_size(&f.path("root link"), &no()).unwrap();
+        assert_eq!(
+            (size.bytes, size.files, size.folders, size.links),
+            (21, 1, 0, 2)
+        );
+    }
+    #[test]
+    fn folder_size_cancellation_and_invalid_roots_are_reported() {
+        let f = Fixture::new();
+        assert_eq!(
+            folder_size(&f.0, &AtomicBool::new(true))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        fs::write(f.path("file"), "content").unwrap();
+        assert_eq!(
+            folder_size(&f.path("file"), &no()).unwrap_err().kind(),
+            io::ErrorKind::NotADirectory
+        );
+        assert_eq!(
+            folder_size(&f.path("missing"), &no()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(folder_size(&f.0, &no()).unwrap().bytes, 7);
+    }
+    #[test]
+    fn folder_size_marks_unreadable_subdirectories_as_partial() {
+        let f = Fixture::new();
+        fs::create_dir(f.path("locked")).unwrap();
+        fs::write(f.path("locked/file"), [0; 500]).unwrap();
+        fs::write(f.path("visible"), [0; 10]).unwrap();
+        fs::set_permissions(f.path("locked"), fs::Permissions::from_mode(0)).unwrap();
+        let size = folder_size(&f.0, &no());
+        fs::set_permissions(f.path("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+        let size = size.unwrap();
+        assert_eq!((size.bytes, size.skipped), (10, 1));
     }
     #[test]
     fn create_never_truncates_existing_file() {

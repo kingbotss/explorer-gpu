@@ -11,7 +11,7 @@ use explorer::{
 };
 use gpui::{prelude::*, *};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -99,6 +99,11 @@ impl Tab {
     }
 }
 enum Message {
+    FolderSize {
+        generation: u64,
+        path: PathBuf,
+        result: std::io::Result<fs::FolderSize>,
+    },
     TerminalOpened(std::io::Result<PathBuf>),
     Loaded {
         tab: usize,
@@ -113,6 +118,14 @@ enum Message {
         path: PathBuf,
         children: Vec<PathBuf>,
     },
+}
+enum SizeValue {
+    Calculating,
+    Ready(fs::FolderSize),
+    Failed(String),
+}
+struct SizeWorker {
+    cancel: Arc<AtomicBool>,
 }
 struct Running {
     cancel: Arc<AtomicBool>,
@@ -131,6 +144,8 @@ enum Modal {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    FolderSizes,
+    CancelSizes,
     Back,
     Forward,
     Up,
@@ -203,6 +218,11 @@ impl Render for DragFiles {
 }
 
 pub struct Explorer {
+    folder_sizes: HashMap<PathBuf, SizeValue>,
+    size_queue: VecDeque<PathBuf>,
+    size_worker: Option<SizeWorker>,
+    size_generation: u64,
+    size_sort_dirty: bool,
     tabs: Vec<Tab>,
     active: usize,
     next_tab: usize,
@@ -258,6 +278,11 @@ impl Explorer {
             .collect();
         let active = settings.active.min(tabs.len() - 1);
         let mut this = Self {
+            folder_sizes: HashMap::new(),
+            size_queue: VecDeque::new(),
+            size_worker: None,
+            size_generation: 0,
+            size_sort_dirty: false,
             next_tab: tabs.len(),
             tabs,
             active,
@@ -344,6 +369,10 @@ impl Explorer {
             }),
         );
         this.focus.focus(window);
+        this.trace(&format!(
+            "started executable={:?}",
+            std::env::current_exe().ok()
+        ));
         this.load(this.active, false, cx);
         cx.spawn(async move |this, cx| {
             loop {
@@ -407,7 +436,39 @@ impl Explorer {
     }
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let (sort, descending) = (self.sort, self.descending);
-        fs::sort(&mut self.tab_mut().entries, sort, descending);
+        if sort == Sort::Size {
+            let cache = &self.folder_sizes;
+            let entries = &mut self.tabs[self.active].entries;
+            fs::sort(entries, Sort::Name, false);
+            entries.sort_by(|a, b| {
+                let bytes = |e: &Entry| {
+                    if e.directory {
+                        match cache.get(&e.path) {
+                            Some(SizeValue::Ready(size)) => Some(size.bytes),
+                            _ => None,
+                        }
+                    } else {
+                        Some(e.bytes)
+                    }
+                };
+                b.directory
+                    .cmp(&a.directory)
+                    .then_with(|| match (bytes(a), bytes(b)) {
+                        (Some(a), Some(b)) => {
+                            if descending {
+                                b.cmp(&a)
+                            } else {
+                                a.cmp(&b)
+                            }
+                        }
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        _ => std::cmp::Ordering::Equal,
+                    })
+            });
+        } else {
+            fs::sort(&mut self.tab_mut().entries, sort, descending);
+        }
         let tab = self.tab();
         let q = tab.query.to_lowercase();
         self.visible = tab
@@ -427,6 +488,9 @@ impl Explorer {
         cx.notify();
     }
     fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.trace(&format!("navigate {:?}", path));
+        self.cancel_sizes();
+        self.folder_sizes.clear();
         self.clicks.clear();
         self.deferred_listing = None;
         self.menu = None;
@@ -481,6 +545,9 @@ impl Explorer {
             return;
         }
         self.clicks.clear();
+        self.cancel_sizes();
+        self.folder_sizes.clear();
+        self.preview_path = None;
         self.active = index;
         self.menu = None;
         self.editing_address = false;
@@ -568,7 +635,70 @@ impl Explorer {
             .iter()
             .position(|index| self.tab().entries[*index].path == path)
     }
+    fn trace(&self, event: &str) {
+        #[cfg(not(test))]
+        {
+            use std::io::Write;
+            let _ = (|| -> std::io::Result<()> {
+                let location = Session::location();
+                let directory = location.parent().unwrap();
+                std::fs::create_dir_all(directory)?;
+                let path = directory.join("input.log");
+                if std::fs::metadata(&path).is_ok_and(|m| m.len() > 128 * 1024) {
+                    std::fs::rename(&path, directory.join("input.previous.log"))?;
+                }
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?;
+                writeln!(
+                    file,
+                    "{:?} v{} pid={} {}",
+                    std::time::SystemTime::now(),
+                    env!("CARGO_PKG_VERSION"),
+                    std::process::id(),
+                    event
+                )
+            })();
+        }
+        #[cfg(test)]
+        let _ = event;
+    }
+    fn press_entry(
+        &mut self,
+        tab: usize,
+        entry: &Entry,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() || self.menu.is_some() {
+            return;
+        }
+        let Some(index) = self.row_index(tab, &entry.path) else {
+            return;
+        };
+        self.focus.focus(window);
+        self.clicks
+            .begin_press((f32::from(event.position.x), f32::from(event.position.y)));
+        let activate = self
+            .clicks
+            .press(tab, &entry.path, Instant::now(), event.click_count);
+        self.trace(&format!(
+            "row-down count={} activate={} selected={} path={:?}",
+            event.click_count,
+            activate,
+            self.tab().selected.contains(&entry.path),
+            entry.path
+        ));
+        if activate {
+            self.select(index, Modifiers::none(), cx);
+            self.open_entry(entry, cx);
+            cx.stop_propagation();
+        }
+    }
     fn open_entry(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        self.trace(&format!("open {:?}", entry.path));
         match Entry::read_for_open(entry.path.clone()) {
             Ok(current) if current.navigable() => self.navigate(current.path, cx),
             Ok(current) => {
@@ -588,6 +718,109 @@ impl Explorer {
             ),
         }
     }
+    fn cancel_sizes(&mut self) {
+        if let Some(worker) = self.size_worker.take() {
+            worker.cancel.store(true, Ordering::Relaxed);
+        }
+        self.size_queue.clear();
+        self.size_generation += 1;
+        self.folder_sizes
+            .retain(|_, value| !matches!(value, SizeValue::Calculating));
+        self.size_sort_dirty = false;
+    }
+    fn request_sizes(&mut self, paths: Vec<PathBuf>, force: bool) {
+        if force {
+            self.cancel_sizes();
+        }
+        for path in paths {
+            if force || !self.folder_sizes.contains_key(&path) {
+                self.folder_sizes
+                    .insert(path.clone(), SizeValue::Calculating);
+                self.size_queue.push_back(path);
+            }
+        }
+        self.start_size_worker();
+    }
+    fn start_size_worker(&mut self) {
+        if self.size_worker.is_some() {
+            return;
+        }
+        let Some(path) = self.size_queue.pop_front() else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.size_worker = Some(SizeWorker {
+            cancel: cancel.clone(),
+        });
+        let tx = self.tx.clone();
+        let generation = self.size_generation;
+        std::thread::spawn(move || {
+            let result = fs::folder_size(&path, &cancel);
+            let _ = tx.send(Message::FolderSize {
+                generation,
+                path,
+                result,
+            });
+        });
+    }
+    fn entry_bytes(&self, entry: &Entry) -> Option<u64> {
+        if !entry.directory {
+            return Some(entry.bytes);
+        }
+        match self.folder_sizes.get(&entry.path) {
+            Some(SizeValue::Ready(size)) => Some(size.bytes),
+            _ => None,
+        }
+    }
+    fn size_label(&self, entry: &Entry, detailed: bool) -> String {
+        if !entry.directory {
+            return if detailed {
+                format!("{} ({} bytes)", fs::human_size(entry.bytes), entry.bytes)
+            } else {
+                fs::human_size(entry.bytes)
+            };
+        }
+        match self.folder_sizes.get(&entry.path) {
+            Some(SizeValue::Ready(size)) => {
+                let bytes = if detailed {
+                    format!(
+                        "{} ({} bytes) · {} files, {} folders, {} links",
+                        fs::human_size(size.bytes),
+                        size.bytes,
+                        size.files,
+                        size.folders,
+                        size.links
+                    )
+                } else {
+                    fs::human_size(size.bytes)
+                };
+                if size.skipped > 0 {
+                    if detailed {
+                        format!("{bytes} · partial ({} unreadable)", size.skipped)
+                    } else {
+                        format!("≥ {bytes}")
+                    }
+                } else {
+                    bytes
+                }
+            }
+            Some(SizeValue::Calculating) => "Calculating…".into(),
+            Some(SizeValue::Failed(error)) => {
+                if detailed {
+                    format!("Unavailable: {error}")
+                } else {
+                    "Unavailable".into()
+                }
+            }
+            None => {
+                if detailed {
+                    "Select Calculate folder sizes to measure".into()
+                } else {
+                    "—".into()
+                }
+            }
+        }
+    }
     fn update_preview(&mut self, _cx: &mut Context<Self>) {
         let paths = self.selected();
         let path = if paths.len() == 1 {
@@ -601,6 +834,9 @@ impl Explorer {
         self.preview_path = path.clone();
         self.preview_body.clear();
         if let Some(path) = path {
+            if path.is_dir() {
+                self.request_sizes(vec![path.clone()], false);
+            }
             let tx = self.tx.clone();
             std::thread::spawn(move || {
                 let body = if path.is_dir() {
@@ -627,6 +863,25 @@ impl Explorer {
                 continue;
             }
             match message {
+                Message::FolderSize {
+                    generation,
+                    path,
+                    result,
+                } => {
+                    if generation == self.size_generation {
+                        self.size_worker = None;
+                        self.folder_sizes.insert(
+                            path,
+                            match result {
+                                Ok(size) => SizeValue::Ready(size),
+                                Err(error) => SizeValue::Failed(error.to_string()),
+                            },
+                        );
+                        self.size_sort_dirty = self.sort == Sort::Size;
+                        self.start_size_worker();
+                        cx.notify();
+                    }
+                }
                 Message::TerminalOpened(result) => {
                     match result {
                         Ok(path) => {
@@ -685,6 +940,10 @@ impl Explorer {
                 }
             }
         }
+        if self.size_sort_dirty && !self.clicks.is_interacting(Instant::now()) {
+            self.size_sort_dirty = false;
+            self.rebuild(cx);
+        }
         let events: Vec<_> = self
             .running
             .as_ref()
@@ -706,6 +965,8 @@ impl Explorer {
                     remaining_undo,
                 } => {
                     self.running = None;
+                    self.cancel_sizes();
+                    self.folder_sizes.clear();
                     if let Some(records) = remaining_undo {
                         if !records.is_empty() {
                             self.undo.push(records);
@@ -765,6 +1026,7 @@ impl Explorer {
     }
     fn result(&mut self, result: std::io::Result<()>, cx: &mut Context<Self>) {
         if let Err(e) = result {
+            self.trace(&format!("error {e}"));
             self.notice = Some((e.to_string(), true));
             cx.notify();
         }
@@ -852,6 +1114,10 @@ impl Explorer {
     }
     pub fn perform(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         let terminal_path = (action == Action::Terminal).then(|| self.terminal_path());
+        let all_sizes = self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| matches!(menu.kind, MenuKind::Background | MenuKind::View));
         self.menu = None;
         if self.running.is_some()
             && matches!(
@@ -875,6 +1141,30 @@ impl Explorer {
         }
         let paths = self.selected();
         match action {
+            Action::FolderSizes => {
+                let entries = if all_sizes {
+                    vec![]
+                } else {
+                    self.selected_entries()
+                };
+                let entries = if entries.is_empty() {
+                    self.visible
+                        .iter()
+                        .map(|&i| self.tab().entries[i].clone())
+                        .collect()
+                } else {
+                    entries
+                };
+                self.request_sizes(
+                    entries
+                        .into_iter()
+                        .filter(|e| e.directory)
+                        .map(|e| e.path)
+                        .collect(),
+                    true,
+                );
+            }
+            Action::CancelSizes => self.cancel_sizes(),
             Action::SortName | Action::SortModified | Action::SortKind | Action::SortSize => {
                 self.sort = match action {
                     Action::SortModified => Sort::Modified,
@@ -882,6 +1172,17 @@ impl Explorer {
                     Action::SortSize => Sort::Size,
                     _ => Sort::Name,
                 };
+                if self.sort == Sort::Size {
+                    self.request_sizes(
+                        self.visible
+                            .iter()
+                            .map(|&i| &self.tab().entries[i])
+                            .filter(|e| e.directory)
+                            .map(|e| e.path.clone())
+                            .collect(),
+                        false,
+                    );
+                }
                 self.rebuild(cx);
             }
             Action::SortDirection => {
@@ -897,6 +1198,8 @@ impl Explorer {
             }
             Action::Home => self.navigate(session::home(), cx),
             Action::Refresh => {
+                self.cancel_sizes();
+                self.folder_sizes.clear();
                 self.tree.clear();
                 self.preview_path = None;
                 self.load(self.active, self.tab().recursive, cx);
@@ -1095,6 +1398,14 @@ impl Explorer {
                         entries.push(e);
                     }
                 }
+                self.request_sizes(
+                    entries
+                        .iter()
+                        .filter(|e| e.directory)
+                        .map(|e| e.path.clone())
+                        .collect(),
+                    false,
+                );
                 self.show_modal(Modal::Properties(entries), "", window, cx);
             }
             Action::Help => self.show_modal(Modal::Help, "", window, cx),
@@ -1890,6 +2201,17 @@ impl Explorer {
                         this.sort = sort;
                         this.descending = sort == Sort::Modified;
                     }
+                    if sort == Sort::Size {
+                        this.request_sizes(
+                            this.visible
+                                .iter()
+                                .map(|&i| &this.tab().entries[i])
+                                .filter(|e| e.directory)
+                                .map(|e| e.path.clone())
+                                .collect(),
+                            false,
+                        );
+                    }
                     this.rebuild(cx);
                 }))
                 .child(label)
@@ -1928,6 +2250,7 @@ impl Explorer {
         let navigable = e.navigable();
         let tab = self.tab().id;
         let pressed_entry = e.clone();
+        let press_view = cx.entity().downgrade();
         let select_path = path.clone();
         let drag = DragFiles {
             paths: if selected {
@@ -1952,7 +2275,30 @@ impl Explorer {
             .when(index == 0, |row| {
                 row.debug_selector(|| "first-file-row".to_owned())
             })
+            .relative()
             .flex()
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let bounds = bounds.intersect(&window.content_mask().bounds);
+                        let press_view = press_view.clone();
+                        let entry = pressed_entry.clone();
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                            if phase == DispatchPhase::Capture
+                                && event.button == MouseButton::Left
+                                && bounds.contains(&event.position)
+                            {
+                                let _ = press_view.update(cx, |this, cx| {
+                                    this.press_entry(tab, &entry, event, window, cx)
+                                });
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
             .rounded_md()
             .cursor_pointer()
             .overflow_hidden()
@@ -1976,6 +2322,10 @@ impl Explorer {
                     ClickEvent::Mouse(mouse) => mouse.down.click_count.max(mouse.up.click_count),
                     ClickEvent::Keyboard(_) => 2,
                 };
+                this.trace(&format!(
+                    "row-click count={native_count} path={:?}",
+                    entry.path
+                ));
                 // Opening takes precedence over selection toggles, including
                 // when the clicked folder is already selected or part of a group.
                 let activate = event.is_keyboard()
@@ -1991,26 +2341,6 @@ impl Explorer {
                 }
                 cx.stop_propagation();
             }))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    let Some(index) = this.row_index(tab, &pressed_entry.path) else {
-                        return;
-                    };
-                    this.menu = None;
-                    this.focus.focus(window);
-                    this.clicks
-                        .begin_press((f32::from(event.position.x), f32::from(event.position.y)));
-                    if this
-                        .clicks
-                        .native_press(tab, &pressed_entry.path, event.click_count)
-                    {
-                        this.select(index, Modifiers::none(), cx);
-                        this.open_entry(&pressed_entry, cx);
-                        cx.stop_propagation();
-                    }
-                }),
-            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -2091,9 +2421,9 @@ impl Explorer {
                         .text_size(px(10.))
                         .text_color(rgb(p.muted))
                         .child(if e.directory {
-                            e.kind
+                            format!("{} · {}", e.kind, self.size_label(&e, false))
                         } else {
-                            fs::human_size(e.bytes)
+                            self.size_label(&e, false)
                         }),
                 )
                 .into_any_element()
@@ -2139,7 +2469,7 @@ impl Explorer {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .child(e.kind),
+                        .child(e.kind.clone()),
                 )
                 .child(
                     div()
@@ -2147,11 +2477,7 @@ impl Explorer {
                         .flex_shrink_0()
                         .text_size(px(11.))
                         .text_color(rgb(p.muted))
-                        .child(if e.directory {
-                            "—".into()
-                        } else {
-                            fs::human_size(e.bytes)
-                        }),
+                        .child(self.size_label(&e, false)),
                 )
                 .into_any_element()
         }
@@ -2427,15 +2753,7 @@ impl Explorer {
                                 .text_color(rgb(p.muted))
                                 .child(e.kind.clone()),
                         )
-                        .child(detail(
-                            "Size",
-                            if e.directory {
-                                "Folder".into()
-                            } else {
-                                fs::human_size(e.bytes)
-                            },
-                            p,
-                        ))
+                        .child(detail("Size", self.size_label(&e, true), p))
                         .child(detail("Modified (UTC)", fs::date(e.modified), p))
                         .when_some(e.created, |d, date| {
                             d.child(detail("Created (UTC)", fs::date(date), p))
@@ -2529,9 +2847,13 @@ impl Explorer {
         let bytes: u64 = self
             .selected_entries()
             .iter()
-            .filter(|e| !e.directory)
-            .map(|e| e.bytes)
-            .sum();
+            .filter_map(|e| self.entry_bytes(e))
+            .fold(0u64, u64::saturating_add);
+        let unknown = self
+            .selected_entries()
+            .iter()
+            .filter(|e| self.entry_bytes(e).is_none())
+            .count();
         div()
             .flex()
             .items_center()
@@ -2547,10 +2869,21 @@ impl Explorer {
             .child(format!("{} items", self.visible.len()))
             .when(count > 0, |d| {
                 d.child(div().w(px(1.)).h(px(12.)).bg(rgb(p.border)))
-                    .child(format!("{count} selected · {}", fs::human_size(bytes)))
+                    .child(format!(
+                        "{count} selected · {}{}",
+                        fs::human_size(bytes),
+                        if unknown > 0 {
+                            format!(" + {unknown} unmeasured")
+                        } else {
+                            String::new()
+                        }
+                    ))
             })
             .child(div().flex_1())
             .when(self.tab().loading, |d| d.child("Searching…"))
+            .when(self.size_worker.is_some(), |d| {
+                d.child("Calculating folder sizes…")
+            })
             .when(self.settings.hidden, |d| d.child("Hidden files visible"))
             .child(if self.settings.grid {
                 "Large icons"
@@ -2586,6 +2919,20 @@ impl Explorer {
                 ),
             ],
             MenuKind::View => vec![
+                (
+                    Action::FolderSizes,
+                    "Calculate all folder sizes",
+                    "drive",
+                    "",
+                    true,
+                ),
+                (
+                    Action::CancelSizes,
+                    "Cancel size calculation",
+                    "close",
+                    "",
+                    self.size_worker.is_some(),
+                ),
                 (Action::Grid, "Large icons", "grid", "⌘2", true),
                 (Action::List, "Details", "list", "⌘1", true),
                 (
@@ -2623,6 +2970,13 @@ impl Explorer {
                 ),
             ],
             MenuKind::Background => vec![
+                (
+                    Action::FolderSizes,
+                    "Calculate folder sizes",
+                    "drive",
+                    "",
+                    true,
+                ),
                 (Action::NewFolder, "New folder", "plus", "⇧⌘N", idle),
                 (Action::NewFile, "New file", "file", "", idle),
                 (Action::Paste, "Paste", "paste", "⌘V", idle),
@@ -2639,6 +2993,13 @@ impl Explorer {
                 (Action::Properties, "Folder properties", "info", "⌘I", true),
             ],
             MenuKind::Selection => vec![
+                (
+                    Action::FolderSizes,
+                    "Calculate folder sizes",
+                    "drive",
+                    "",
+                    true,
+                ),
                 (Action::Open, "Open", "folder", "↵", n > 0),
                 (
                     Action::OpenExternal,
@@ -2715,8 +3076,14 @@ impl Explorer {
                                 .when(action == Action::SortModified, |d| {
                                     d.debug_selector(|| "menu-sort-modified".to_owned())
                                 })
+                                .when(action == Action::SortSize, |d| {
+                                    d.debug_selector(|| "menu-sort-size".to_owned())
+                                })
                                 .when(action == Action::Terminal, |d| {
                                     d.debug_selector(|| "menu-terminal".to_owned())
+                                })
+                                .when(action == Action::FolderSizes, |d| {
+                                    d.debug_selector(|| "menu-folder-sizes".to_owned())
                                 })
                                 .flex()
                                 .items_center()
@@ -2836,15 +3203,7 @@ impl Explorer {
                         .child(detail("Name", e.name.clone(), p))
                         .child(detail("Kind", e.kind.clone(), p))
                         .child(detail("Location", e.path.to_string_lossy().into_owned(), p))
-                        .child(detail(
-                            "Size",
-                            if e.directory {
-                                "Folder (size not calculated)".into()
-                            } else {
-                                format!("{} ({} bytes)", fs::human_size(e.bytes), e.bytes)
-                            },
-                            p,
-                        ))
+                        .child(detail("Size", self.size_label(e, true), p))
                         .child(detail("Modified (UTC)", fs::date(e.modified), p))
                         .when_some(e.created, |d, t| {
                             d.child(detail("Created (UTC)", fs::date(t), p))
@@ -2863,13 +3222,19 @@ impl Explorer {
                     content = content
                         .child(detail("Items", entries.len().to_string(), p))
                         .child(detail(
-                            "Files total",
-                            fs::human_size(
+                            "Total size",
+                            format!(
+                                "{} · {} unmeasured",
+                                fs::human_size(
+                                    entries
+                                        .iter()
+                                        .filter_map(|e| self.entry_bytes(e))
+                                        .fold(0u64, u64::saturating_add)
+                                ),
                                 entries
                                     .iter()
-                                    .filter(|e| !e.directory)
-                                    .map(|e| e.bytes)
-                                    .sum(),
+                                    .filter(|e| self.entry_bytes(e).is_none())
+                                    .count()
                             ),
                             p,
                         ));
@@ -3040,6 +3405,12 @@ impl Render for Explorer {
                 canvas(
                     |_, _, _| (),
                     move |_, _, window, _| {
+                        let down_view = pointer_view.clone();
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture {
+                                let _ = down_view.update(cx, |this, cx| this.trace(&format!("root-down button={:?} count={} pos={:?} modifiers={:?} drag={}", event.button, event.click_count, event.position, event.modifiers, cx.has_active_drag())));
+                            }
+                        });
                         let motion_view = pointer_view.clone();
                         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture
@@ -3174,6 +3545,7 @@ impl Render for Explorer {
 }
 impl Drop for Explorer {
     fn drop(&mut self) {
+        self.cancel_sizes();
         for tab in &self.tabs {
             tab.cancel.store(true, Ordering::Relaxed);
         }

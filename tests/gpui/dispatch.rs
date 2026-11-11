@@ -88,6 +88,15 @@ impl Fixture {
         self.click(p, modifiers, 1, jitter);
         self.click(p, modifiers, if native { 2 } else { 1 }, jitter);
     }
+    fn select_then_finish_sequence(&mut self) {
+        let p = self.point("first-file-row");
+        self.click(p, Modifiers::none(), 1, false);
+        self.visual
+            .read(|cx| assert!(self.view.read(cx).tab().selected.contains(&self.expected)));
+        let view = self.view.clone();
+        self.visual
+            .update(|_, cx| view.update(cx, |view, _| view.clicks.clear()));
+    }
     fn assert_open(&self) {
         self.visual
             .read(|cx| assert_eq!(self.view.read(cx).tab().path, self.expected));
@@ -182,19 +191,24 @@ fn single_click_selects_without_opening(cx: &mut TestAppContext) {
     });
 }
 #[gpui::test]
-fn command_clicks_only_modify_selection(cx: &mut TestAppContext) {
+fn command_single_click_only_modifies_selection(cx: &mut TestAppContext) {
     let mut f = Fixture::new(cx, false, false);
-    f.double(
+    let p = f.point("first-file-row");
+    f.click(
+        p,
         Modifiers {
             platform: true,
             ..Modifiers::none()
         },
-        true,
+        1,
         false,
     );
-    f.visual
-        .read(|cx| assert_eq!(f.view.read(cx).tab().path, f.path));
+    f.visual.read(|cx| {
+        assert_eq!(f.view.read(cx).tab().path, f.path);
+        assert!(f.view.read(cx).tab().selected.contains(&f.expected));
+    });
 }
+
 #[gpui::test]
 fn selected_folder_enter_still_opens(cx: &mut TestAppContext) {
     let mut f = Fixture::new(cx, false, false);
@@ -235,4 +249,83 @@ fn sort_menu_changes_sort_column(cx: &mut TestAppContext) {
     f.menu_click("command-Sort", "menu-sort-modified");
     f.visual
         .read(|cx| assert_eq!(f.view.read(cx).sort, Sort::Modified));
+}
+
+#[gpui::test]
+fn already_selected_list_folder_opens_on_double_click(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    f.select_then_finish_sequence();
+    f.double(Modifiers::none(), true, false);
+    f.assert_open();
+}
+#[gpui::test]
+fn already_selected_grid_folder_opens_on_double_click(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, true, false);
+    f.select_then_finish_sequence();
+    f.double(Modifiers::none(), true, false);
+    f.assert_open();
+}
+#[gpui::test]
+fn already_selected_folder_opens_with_synthetic_double_click(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    f.select_then_finish_sequence();
+    f.double(Modifiers::none(), false, false);
+    f.assert_open();
+}
+#[gpui::test]
+fn already_selected_folder_symlink_opens_on_double_click(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, true);
+    f.select_then_finish_sequence();
+    f.double(Modifiers::none(), true, false);
+    f.assert_open();
+}
+#[gpui::test]
+fn selected_folder_double_click_wins_over_selection_toggle(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    f.select_then_finish_sequence();
+    f.double(
+        Modifiers {
+            platform: true,
+            ..Modifiers::none()
+        },
+        true,
+        false,
+    );
+    f.assert_open();
+}
+
+#[gpui::test]
+fn selected_folder_double_click_opens_with_shift_held(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    f.select_then_finish_sequence();
+    f.double(
+        Modifiers {
+            shift: true,
+            ..Modifiers::none()
+        },
+        true,
+        false,
+    );
+    f.assert_open();
+}
+#[gpui::test]
+fn double_click_opens_clicked_folder_from_multiple_selection(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    let other = f.path.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let view = f.view.clone();
+    let selected = f.expected.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tab_mut()
+                .entries
+                .push(Entry::read(other.clone()).unwrap());
+            view.visible = vec![0, 1];
+            view.tab_mut().selected.extend([selected, other]);
+            cx.notify();
+        })
+    });
+    f.visual.run_until_parked();
+    f.double(Modifiers::none(), true, false);
+    f.assert_open();
 }

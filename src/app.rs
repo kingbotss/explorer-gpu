@@ -149,6 +149,7 @@ pub enum Action {
     Compress,
     Extract,
     Open,
+    OpenExternal,
     QuickLook,
     Reveal,
     Terminal,
@@ -569,7 +570,14 @@ impl Explorer {
     fn open_entry(&mut self, entry: &Entry, cx: &mut Context<Self>) {
         match Entry::read_for_open(entry.path.clone()) {
             Ok(current) if current.navigable() => self.navigate(current.path, cx),
-            Ok(current) => self.result(native::open(&current.path), cx),
+            Ok(current) => {
+                let result = if let Some(kind) = explorer::media::kind(&current.path) {
+                    native::open_media(&current.path, kind)
+                } else {
+                    native::open(&current.path)
+                };
+                self.result(result, cx);
+            }
             Err(error) => self.result(
                 Err(std::io::Error::new(
                     error.kind(),
@@ -993,21 +1001,23 @@ impl Explorer {
                 }
             }
             Action::Open => {
-                if paths.len() == 1 {
-                    if let Some(entry) = self.selected_entries().first() {
-                        self.open_entry(entry, cx);
-                    }
+                let entries = self.selected_entries();
+                if entries.len() == 1 {
+                    self.open_entry(&entries[0], cx);
                 } else {
-                    for p in paths {
-                        if !p.is_dir() {
-                            self.result(native::open(&p), cx);
-                        }
+                    for entry in entries.into_iter().filter(|entry| !entry.directory) {
+                        self.open_entry(&entry, cx);
                     }
                 }
             }
             Action::QuickLook => {
                 if !paths.is_empty() {
                     self.result(native::quick_look(&paths), cx);
+                }
+            }
+            Action::OpenExternal => {
+                for path in paths {
+                    self.result(native::open(&path), cx);
                 }
             }
             Action::Reveal => {
@@ -1920,24 +1930,22 @@ impl Explorer {
                 let modifiers = event.modifiers();
                 this.menu = None;
                 this.focus.focus(window);
-                this.select(index, modifiers, cx);
-                // Fn is not a file-selection modifier. Using modified() here
-                // disabled activation while the selection callback still worked.
-                if modifiers.platform || modifiers.shift || modifiers.control {
-                    this.clicks.clear();
-                } else {
-                    let native_count = match event {
-                        ClickEvent::Mouse(mouse) => {
-                            mouse.down.click_count.max(mouse.up.click_count)
-                        }
-                        ClickEvent::Keyboard(_) => 2,
-                    };
-                    if this
+                let native_count = match event {
+                    ClickEvent::Mouse(mouse) => mouse.down.click_count.max(mouse.up.click_count),
+                    ClickEvent::Keyboard(_) => 2,
+                };
+                // Opening takes precedence over selection toggles, including
+                // when the clicked folder is already selected or part of a group.
+                let activate = event.is_keyboard()
+                    || this
                         .clicks
-                        .complete(tab, &entry.path, Instant::now(), native_count)
-                    {
-                        this.open_entry(&entry, cx);
-                    }
+                        .complete(tab, &entry.path, Instant::now(), native_count);
+                if activate {
+                    this.clicks.clear();
+                    this.select(index, Modifiers::none(), cx);
+                    this.open_entry(&entry, cx);
+                } else {
+                    this.select(index, modifiers, cx);
                 }
                 cx.stop_propagation();
             }))
@@ -2420,29 +2428,47 @@ impl Explorer {
                                 ))
                                 .child(self.button(Action::Reveal, "", "folder", false, true, cx)),
                         )
-                        .when(!e.directory && !image, |d| {
-                            d.child(
-                                div()
-                                    .mt_5()
-                                    .border_t_1()
-                                    .border_color(rgb(p.border))
-                                    .pt_4()
-                                    .child(
-                                        div()
-                                            .mb_3()
-                                            .text_size(px(10.))
-                                            .text_color(rgb(p.muted))
-                                            .child("TEXT PREVIEW"),
-                                    )
-                                    .child(div().text_size(px(11.)).font_family("Menlo").child(
-                                        if self.preview_body.is_empty() {
-                                            "Loading preview…".into()
-                                        } else {
-                                            self.preview_body.clone()
-                                        },
-                                    )),
-                            )
-                        })
+                        .when(
+                            !e.directory && explorer::media::kind(&e.path).is_some(),
+                            |d| {
+                                d.child(div().mt_3().child(self.button(
+                                    Action::Open,
+                                    "Open viewer",
+                                    e.icon(),
+                                    false,
+                                    true,
+                                    cx,
+                                )))
+                            },
+                        )
+                        .when(
+                            !e.directory && !image && explorer::media::kind(&e.path).is_none(),
+                            |d| {
+                                d.child(
+                                    div()
+                                        .mt_5()
+                                        .border_t_1()
+                                        .border_color(rgb(p.border))
+                                        .pt_4()
+                                        .child(
+                                            div()
+                                                .mb_3()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(p.muted))
+                                                .child("TEXT PREVIEW"),
+                                        )
+                                        .child(
+                                            div().text_size(px(11.)).font_family("Menlo").child(
+                                                if self.preview_body.is_empty() {
+                                                    "Loading preview…".into()
+                                                } else {
+                                                    self.preview_body.clone()
+                                                },
+                                            ),
+                                        ),
+                                )
+                            },
+                        )
                     }),
             )
     }
@@ -2563,6 +2589,13 @@ impl Explorer {
             ],
             MenuKind::Selection => vec![
                 (Action::Open, "Open", "folder", "↵", n > 0),
+                (
+                    Action::OpenExternal,
+                    "Open externally",
+                    "forward",
+                    "",
+                    n > 0,
+                ),
                 (Action::QuickLook, "Quick Look", "eye", "Space", n > 0),
                 (Action::Copy, "Copy", "copy", "⌘C", n > 0),
                 (Action::Cut, "Cut", "cut", "⌘X", n > 0),

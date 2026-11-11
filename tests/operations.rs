@@ -199,3 +199,82 @@ fn creates_do_not_replace_existing_items() {
     assert!(!e.is_empty());
     assert!(f.path("folder").is_dir());
 }
+
+fn write_test_bmp(path: &std::path::Path) {
+    let mut bytes = vec![0u8; 58];
+    bytes[0..2].copy_from_slice(b"BM");
+    bytes[2..6].copy_from_slice(&58u32.to_le_bytes());
+    bytes[10..14].copy_from_slice(&54u32.to_le_bytes());
+    bytes[14..18].copy_from_slice(&40u32.to_le_bytes());
+    bytes[18..22].copy_from_slice(&1i32.to_le_bytes());
+    bytes[22..26].copy_from_slice(&1i32.to_le_bytes());
+    bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+    bytes[28..30].copy_from_slice(&24u16.to_le_bytes());
+    bytes[34..38].copy_from_slice(&4u32.to_le_bytes());
+    bytes[56] = 255;
+    std::fs::write(path, bytes).unwrap();
+}
+fn write_test_pdf(path: &std::path::Path) {
+    let mut data = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0];
+    for (i, body) in [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        offsets.push(data.len());
+        data.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", i + 1, body).as_bytes());
+    }
+    let xref = data.len();
+    data.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        data.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    data.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    std::fs::write(path, data).unwrap();
+}
+#[test]
+fn native_image_decoder_reads_valid_image() {
+    let f = Fixture::new();
+    write_test_bmp(&f.path("image.bmp"));
+    assert_eq!(
+        native::probe_media(&f.path("image.bmp"), explorer::media::MediaKind::Image).unwrap(),
+        1
+    );
+}
+#[test]
+fn native_image_decoder_rejects_invalid_data() {
+    let f = Fixture::new();
+    std::fs::write(f.path("bad.png"), "not an image").unwrap();
+    assert!(native::probe_media(&f.path("bad.png"), explorer::media::MediaKind::Image).is_err());
+}
+#[test]
+fn native_image_decoder_follows_symlink() {
+    let f = Fixture::new();
+    write_test_bmp(&f.path("target.bmp"));
+    std::os::unix::fs::symlink("target.bmp", f.path("link")).unwrap();
+    assert_eq!(
+        native::probe_media(&f.path("link"), explorer::media::MediaKind::Image).unwrap(),
+        1
+    );
+}
+#[test]
+fn native_pdf_decoder_reads_page_count() {
+    let f = Fixture::new();
+    write_test_pdf(&f.path("document.pdf"));
+    assert_eq!(
+        native::probe_media(&f.path("document.pdf"), explorer::media::MediaKind::Pdf).unwrap(),
+        1
+    );
+}
+#[test]
+fn native_pdf_decoder_rejects_invalid_data() {
+    let f = Fixture::new();
+    std::fs::write(f.path("bad.pdf"), "not a PDF").unwrap();
+    assert!(native::probe_media(&f.path("bad.pdf"), explorer::media::MediaKind::Pdf).is_err());
+}

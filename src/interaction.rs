@@ -157,7 +157,7 @@ mod tests {
         assert!(!clicks.complete(1, path(), now + Duration::from_millis(200), 3));
     }
     #[test]
-    fn modified_click_or_navigation_clears_pair() {
+    fn clearing_navigation_state_breaks_click_pair() {
         let mut clicks = RowClicks::default();
         let now = Instant::now();
         assert!(!clicks.complete(1, path(), now, 1));

@@ -12,6 +12,43 @@ unsafe extern "C" {
     fn explorer_clipboard_write(paths: *const *const c_char, count: usize) -> i64;
     fn explorer_clipboard_read() -> *mut c_char;
     fn explorer_clipboard_version() -> i64;
+    fn explorer_open_media(path: *const c_char, kind: i32, error: *mut *mut c_char) -> i32;
+    fn explorer_viewer_count() -> usize;
+    fn explorer_set_main_window_count(count: usize);
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn explorer_probe_media(path: *const c_char, kind: i32, error: *mut *mut c_char) -> usize;
+}
+pub fn set_main_window_count(count: usize) {
+    unsafe { explorer_set_main_window_count(count) }
+}
+pub fn viewer_count() -> usize {
+    unsafe { explorer_viewer_count() }
+}
+pub fn open_media(path: &Path, kind: explorer::media::MediaKind) -> io::Result<()> {
+    let path = cpath(path)?;
+    let mut error = std::ptr::null_mut();
+    if unsafe { explorer_open_media(path.as_ptr(), kind as i32, &mut error) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            String::from_utf8_lossy(&unsafe { take(error) }).into_owned(),
+        ))
+    }
+}
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn probe_media(path: &Path, kind: explorer::media::MediaKind) -> io::Result<usize> {
+    let path = cpath(path)?;
+    let mut error = std::ptr::null_mut();
+    let result = unsafe { explorer_probe_media(path.as_ptr(), kind as i32, &mut error) };
+    if result > 0 {
+        Ok(result)
+    } else {
+        Err(io::Error::other(
+            String::from_utf8_lossy(&unsafe { take(error) }).into_owned(),
+        ))
+    }
 }
 pub fn double_click_interval() -> std::time::Duration {
     let seconds = unsafe { explorer_double_click_interval() };

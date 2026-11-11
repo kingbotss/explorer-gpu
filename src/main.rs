@@ -22,7 +22,8 @@ fn main() {
         .with_assets(icons::Assets)
         .run(|cx: &mut App| {
             cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
+                native::set_main_window_count(cx.windows().len());
+                if cx.windows().is_empty() && native::viewer_count() == 0 {
                     cx.quit();
                 }
             })
@@ -48,8 +49,8 @@ fn main() {
                     items: vec![
                         MenuItem::action("Undo File Operation", UndoFiles),
                         MenuItem::separator(),
-                        MenuItem::action("Copy Files", CopyFiles),
-                        MenuItem::action("Paste Files", PasteFiles),
+                        MenuItem::os_action("Copy", CopyFiles, OsAction::Copy),
+                        MenuItem::os_action("Paste", PasteFiles, OsAction::Paste),
                     ],
                 },
                 Menu {
@@ -76,6 +77,7 @@ fn main() {
                 |window, cx| cx.new(|cx| app::Explorer::new(window, cx)),
             )
             .expect("Could not open the Explorer window");
+            native::set_main_window_count(cx.windows().len());
             cx.activate(true);
         });
 }

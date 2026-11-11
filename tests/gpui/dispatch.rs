@@ -141,6 +141,21 @@ fn list_native_double_click_opens(cx: &mut TestAppContext) {
     f.assert_open();
 }
 #[gpui::test]
+fn recorded_150ms_system_threshold_still_accepts_180ms_click_pairs(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    let view = f.view.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.clicks = super::RowClicks::for_system(std::time::Duration::from_millis(150));
+        })
+    });
+    let p = f.point("first-file-row");
+    f.click(p, Modifiers::none(), 1, false);
+    std::thread::sleep(std::time::Duration::from_millis(180));
+    f.click(p, Modifiers::none(), 1, false);
+    f.assert_open();
+}
+#[gpui::test]
 fn two_captured_presses_open_even_without_click_completions_or_native_counts(
     cx: &mut TestAppContext,
 ) {

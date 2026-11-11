@@ -27,6 +27,14 @@ impl Default for RowClicks {
     }
 }
 impl RowClicks {
+    /// Keep a usable app activation window when macOS is configured for very
+    /// fast double-clicks; preserve slower accessibility preferences.
+    pub fn for_system(interval: Duration) -> Self {
+        Self::new(interval.max(Duration::from_millis(500)))
+    }
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
     pub fn new(interval: Duration) -> Self {
         Self {
             last: None,
@@ -306,7 +314,7 @@ mod tests {
     }
     #[test]
     fn system_slow_double_click_preference_is_honored() {
-        let mut clicks = RowClicks::new(Duration::from_millis(900));
+        let mut clicks = RowClicks::for_system(Duration::from_millis(900));
         let now = Instant::now();
         clicks.complete(1, path(), now, 1);
         clicks.release();

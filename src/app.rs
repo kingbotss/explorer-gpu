@@ -296,7 +296,7 @@ impl Explorer {
             field: field.clone(),
             editing_address: false,
             scroll: UniformListScrollHandle::new(),
-            clicks: RowClicks::new(native::double_click_interval()),
+            clicks: RowClicks::for_system(native::double_click_interval()),
             deferred_listing: None,
             modal: None,
             modal_error: None,
@@ -370,8 +370,10 @@ impl Explorer {
         );
         this.focus.focus(window);
         this.trace(&format!(
-            "started executable={:?}",
-            std::env::current_exe().ok()
+            "started executable={:?} system_double_click_ms={} activation_double_click_ms={}",
+            std::env::current_exe().ok(),
+            native::double_click_interval().as_millis(),
+            this.clicks.interval().as_millis()
         ));
         this.load(this.active, false, cx);
         cx.spawn(async move |this, cx| {

@@ -99,6 +99,7 @@ impl Tab {
     }
 }
 enum Message {
+    TerminalOpened(std::io::Result<PathBuf>),
     Loaded {
         tab: usize,
         revision: u64,
@@ -626,6 +627,16 @@ impl Explorer {
                 continue;
             }
             match message {
+                Message::TerminalOpened(result) => {
+                    match result {
+                        Ok(path) => {
+                            self.notice =
+                                Some((format!("Opened Terminal in {}", path.display()), false))
+                        }
+                        Err(error) => self.result(Err(error), cx),
+                    }
+                    cx.notify();
+                }
                 Message::Loaded {
                     tab,
                     revision,
@@ -826,7 +837,21 @@ impl Explorer {
         self.close_modal(window, cx);
         self.start(job, "Working…", cx);
     }
+    fn terminal_path(&self) -> PathBuf {
+        if !self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.kind == MenuKind::Background)
+        {
+            let paths = self.selected();
+            if paths.len() == 1 {
+                return paths[0].clone();
+            }
+        }
+        self.tab().path.clone()
+    }
     pub fn perform(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        let terminal_path = (action == Action::Terminal).then(|| self.terminal_path());
         self.menu = None;
         if self.running.is_some()
             && matches!(
@@ -1025,8 +1050,12 @@ impl Explorer {
                 self.result(native::reveal(&p), cx);
             }
             Action::Terminal => {
-                let p = self.tab().path.clone();
-                self.result(native::terminal(&p), cx);
+                let p = terminal_path.unwrap();
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let result = native::terminal(&p);
+                    let _ = tx.send(Message::TerminalOpened(result));
+                });
             }
             Action::Pin => {
                 let p = if paths.len() == 1 && paths[0].is_dir() {
@@ -1250,6 +1279,9 @@ impl Explorer {
         let title: SharedString = label.to_owned().into();
         div()
             .id(("action", action as usize))
+            .when(action == Action::Terminal, |d| {
+                d.debug_selector(|| "command-terminal".to_owned())
+            })
             .flex()
             .items_center()
             .justify_center()
@@ -1284,7 +1316,12 @@ impl Explorer {
             .bg(rgb(p.surface))
             .child(div().w(px(84.)).flex_shrink_0())
             .child(item_icon("folder", 0xf4c249, 17.))
-            .child(div().ml_2().text_size(px(12.)).child("File Explorer"))
+            .child(
+                div()
+                    .ml_2()
+                    .text_size(px(12.))
+                    .child(format!("File Explorer · {}", env!("CARGO_PKG_VERSION"))),
+            )
             .child(
                 div()
                     .flex_1()
@@ -1551,6 +1588,7 @@ impl Explorer {
             .child(separator())
             .child(self.menu_button("Sort", "sort", MenuKind::Sort, cx))
             .child(self.menu_button("View", "list", MenuKind::View, cx))
+            .child(self.button(Action::Terminal, "Terminal", "terminal", false, true, cx))
             .child(self.button(
                 Action::Undo,
                 "",
@@ -1927,6 +1965,10 @@ impl Explorer {
                     return;
                 };
                 let entry = this.tab().entries[this.visible[index]].clone();
+                if this.clicks.consume_native_release(tab, &entry.path) {
+                    cx.stop_propagation();
+                    return;
+                }
                 let modifiers = event.modifiers();
                 this.menu = None;
                 this.focus.focus(window);
@@ -1951,14 +1993,22 @@ impl Explorer {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, window, _cx| {
-                    if this.row_index(tab, &pressed_entry.path).is_none() {
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    let Some(index) = this.row_index(tab, &pressed_entry.path) else {
                         return;
-                    }
+                    };
                     this.menu = None;
                     this.focus.focus(window);
                     this.clicks
                         .begin_press((f32::from(event.position.x), f32::from(event.position.y)));
+                    if this
+                        .clicks
+                        .native_press(tab, &pressed_entry.path, event.click_count)
+                    {
+                        this.select(index, Modifiers::none(), cx);
+                        this.open_entry(&pressed_entry, cx);
+                        cx.stop_propagation();
+                    }
                 }),
             )
             .on_mouse_down(
@@ -2113,6 +2163,7 @@ impl Explorer {
         let rows = if grid { count.div_ceil(4) } else { count };
         div()
             .id("files-area")
+            .debug_selector(|| "files-area".to_owned())
             .flex()
             .flex_col()
             .flex_1()
@@ -2597,6 +2648,7 @@ impl Explorer {
                     n > 0,
                 ),
                 (Action::QuickLook, "Quick Look", "eye", "Space", n > 0),
+                (Action::Terminal, "Open in Terminal", "terminal", "", true),
                 (Action::Copy, "Copy", "copy", "⌘C", n > 0),
                 (Action::Cut, "Cut", "cut", "⌘X", n > 0),
                 (Action::Paste, "Paste", "paste", "⌘V", idle),
@@ -2662,6 +2714,9 @@ impl Explorer {
                                 })
                                 .when(action == Action::SortModified, |d| {
                                     d.debug_selector(|| "menu-sort-modified".to_owned())
+                                })
+                                .when(action == Action::Terminal, |d| {
+                                    d.debug_selector(|| "menu-terminal".to_owned())
                                 })
                                 .flex()
                                 .items_center()

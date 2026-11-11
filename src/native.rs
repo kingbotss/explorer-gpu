@@ -136,11 +136,40 @@ pub fn quick_look(paths: &[PathBuf]) -> io::Result<()> {
     });
     Ok(())
 }
-pub fn terminal(path: &Path) -> io::Result<()> {
-    launch(
-        "/usr/bin/open",
-        &["-a".as_ref(), "Terminal".as_ref(), path.as_os_str()],
-    )
+pub fn terminal_directory(path: &Path) -> io::Result<PathBuf> {
+    let resolved = std::fs::canonicalize(path)?;
+    if resolved.is_dir() {
+        Ok(resolved)
+    } else {
+        resolved
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| io::Error::other("Missing containing folder"))
+    }
+}
+pub fn terminal(path: &Path) -> io::Result<PathBuf> {
+    let directory = terminal_directory(path)?;
+    // Run on the caller's worker thread; report Launch Services failures rather
+    // than treating a successful spawn of /usr/bin/open as a successful launch.
+    // Pass the folder as an argv value, never as a shell or AppleScript command.
+    let result = Command::new("/usr/bin/open")
+        .args(["-a", "/System/Applications/Utilities/Terminal.app"])
+        .arg(&directory)
+        .output()?;
+    if result.status.success() {
+        Ok(directory)
+    } else {
+        let detail = String::from_utf8_lossy(&result.stderr);
+        Err(io::Error::other(format!(
+            "Cannot open Terminal in {}: {}",
+            directory.display(),
+            if detail.trim().is_empty() {
+                result.status.to_string()
+            } else {
+                detail.trim().to_owned()
+            }
+        )))
+    }
 }
 pub fn compress(path: &Path, target: &Path) -> io::Result<()> {
     // Reserve a private staging folder: ditto cannot overwrite any existing user file.

@@ -4,8 +4,8 @@
 <key>CFBundleName</key><string>Explorer</string>
 <key>CFBundleDisplayName</key><string>Explorer</string>
 <key>CFBundleIdentifier</key><string>com.explorer.mac</string>
-<key>CFBundleVersion</key><string>5</string>
-<key>CFBundleShortVersionString</key><string>0.3.0</string>
+<key>CFBundleVersion</key><string>6</string>
+<key>CFBundleShortVersionString</key><string>0.3.1</string>
 <key>CFBundleExecutable</key><string>Explorer</string>
 <key>CFBundleIconFile</key><string>Explorer.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>

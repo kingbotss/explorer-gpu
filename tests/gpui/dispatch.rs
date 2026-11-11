@@ -121,6 +121,113 @@ fn list_native_double_click_opens(cx: &mut TestAppContext) {
     f.assert_open();
 }
 #[gpui::test]
+fn native_second_press_opens_before_a_lost_release(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    f.select_then_finish_sequence();
+    let p = f.point("first-file-row");
+    f.click(p, Modifiers::none(), 1, false);
+    f.visual.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: p,
+        modifiers: Modifiers {
+            function: true,
+            ..Modifiers::none()
+        },
+        click_count: 2,
+        first_mouse: false,
+    });
+    f.assert_open();
+}
+#[gpui::test]
+fn selected_grid_folder_opens_on_native_second_press(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, true, false);
+    f.select_then_finish_sequence();
+    let p = f.point("first-file-row");
+    f.click(p, Modifiers::none(), 1, false);
+    f.visual.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: p,
+        modifiers: Modifiers::none(),
+        click_count: 2,
+        first_mouse: false,
+    });
+    f.assert_open();
+    // The eventual release cannot start a copy or activate a child row.
+    f.visual.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: p + point(px(12.), px(2.)),
+        modifiers: Modifiers::none(),
+        click_count: 2,
+    });
+    f.assert_open();
+    f.visual
+        .read(|cx| assert!(f.view.read(cx).running.is_none()));
+}
+#[gpui::test]
+fn native_release_after_failed_open_preserves_selection_and_does_not_drag(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, true);
+    f.select_then_finish_sequence();
+    std::fs::remove_dir(f.path.join("folder")).unwrap();
+    let modifiers = Modifiers {
+        platform: true,
+        ..Modifiers::none()
+    };
+    let p = f.point("first-file-row");
+    f.click(p, modifiers, 1, false);
+    f.visual.simulate_event(MouseDownEvent {
+        button: MouseButton::Left,
+        position: p,
+        modifiers,
+        click_count: 2,
+        first_mouse: false,
+    });
+    let up = p + point(px(12.), px(2.));
+    f.visual
+        .simulate_mouse_move(up, MouseButton::Left, modifiers);
+    f.visual.simulate_event(MouseUpEvent {
+        button: MouseButton::Left,
+        position: up,
+        modifiers,
+        click_count: 2,
+    });
+    f.visual.read(|cx| {
+        let view = f.view.read(cx);
+        assert!(view.tab().selected.contains(&f.expected));
+        assert!(view.notice.as_ref().unwrap().1);
+        assert!(view.running.is_none());
+        assert!(!cx.has_active_drag());
+    });
+}
+#[gpui::test]
+fn terminal_remains_available_for_selected_folder_and_background(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    f.select_then_finish_sequence();
+    f.point("command-terminal");
+    let p = f.point("first-file-row");
+    f.visual.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: p,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    f.point("menu-terminal");
+    f.visual
+        .read(|cx| assert_eq!(f.view.read(cx).terminal_path(), f.expected));
+    f.visual.simulate_keystrokes("escape");
+    let b = f.visual.debug_bounds("files-area").unwrap();
+    f.visual.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: point(b.right() - px(10.), b.bottom() - px(10.)),
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    f.point("menu-terminal");
+    f.visual
+        .read(|cx| assert_eq!(f.view.read(cx).terminal_path(), f.path));
+}
+#[gpui::test]
 fn list_synthetic_double_click_opens(cx: &mut TestAppContext) {
     let mut f = Fixture::new(cx, false, false);
     f.double(Modifiers::none(), false, false);

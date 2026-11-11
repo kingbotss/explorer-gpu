@@ -52,6 +52,20 @@ fn run(job: Job) -> (Vec<Change>, Vec<String>, Option<Vec<Change>>) {
     panic!("Operation did not complete")
 }
 #[test]
+fn terminal_resolves_folders_files_and_symlinks_without_shell_interpretation() {
+    let f = Fixture::new();
+    let directory = f.path("folder ' with $ and spaces");
+    std::fs::create_dir(&directory).unwrap();
+    let file = directory.join("file.txt");
+    std::fs::write(&file, "test").unwrap();
+    std::os::unix::fs::symlink(&directory, f.path("folder link")).unwrap();
+    let expected = std::fs::canonicalize(&directory).unwrap();
+    for path in [&directory, &file, &f.path("folder link")] {
+        assert_eq!(native::terminal_directory(path).unwrap(), expected);
+    }
+    assert!(native::terminal(&f.path("missing")).is_err());
+}
+#[test]
 fn job_copy_generates_nonconflicting_names() {
     let f = Fixture::new();
     std::fs::write(f.path("file.txt"), "original").unwrap();

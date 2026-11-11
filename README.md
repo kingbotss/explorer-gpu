@@ -2,11 +2,11 @@
 
 A native Rust + GPUI file manager with a Windows 11 Explorer-style interface: neutral surfaces, compact tabs and command bar, yellow folder icons, a navigation tree, details/grid views, and an optional preview pane. GPUI renders the interface directly; there is no browser or webview.
 
-**Status: initial implementation.** The full GPUI application passes `cargo check --all-targets` and builds in release mode. The 64 core/native-operation tests and 21 rendered GPUI event tests pass, and the signed app bundle is generated at `dist/Explorer.app`. Interactive validation is still outstanding: this development session cannot connect to macOS GUI services to open a window. Full Windows Explorer/Finder feature parity is not claimed.
+**Status: initial implementation.** The full GPUI application passes `cargo check --all-targets` and builds in release mode. The 67 core/native-operation tests and 25 rendered GPUI event tests pass, and the signed app bundle is generated at `dist/Explorer.app`. Interactive validation is still outstanding: this development session cannot connect to macOS GUI services to open a window. Full Windows Explorer/Finder feature parity is not claimed.
 
 ## Run
 
-Version 0.3.0 adds in-app image/video/PDF windows and makes double-click opening take priority over selection toggles, including already-selected folders. Quit any running copy and reopen `dist/Explorer.app` to load this version; About Explorer shows the version.
+Version 0.3.1 opens native double-clicks on the second press, so an interrupted release cannot swallow the action. Open in Terminal is available on the command bar and both background/selection menus, with launch failures shown in the app. The image/video/PDF viewers remain available. Quit any running copy and reopen `dist/Explorer.app` to load this version; the title bar and About Explorer show the version.
 
 Requires macOS 12+, a recent stable Rust toolchain (edition 2024), Xcode command-line tools, and internet access for the first dependency download. GPUI is pinned to 0.2.2 with its `runtime_shaders` feature: macOS compiles the embedded Metal shaders at launch, so the separate Xcode Metal compiler download is not required.
 
@@ -33,7 +33,7 @@ The bundle script builds a release binary, generates a Retina app icon, includes
 - Expandable folder tree, common macOS locations, mounted volumes, iCloud Drive when present, and persistent folder pins.
 - Virtualized details and four-column grid views; natural filename sorting; sortable name/date/kind/size columns; folders first; hidden-file toggle.
 - Single, Command-click, Shift-click, keyboard, and select-all selection.
-- Double-click activation uses the same completed-click callback as selection, honors native click counts, and falls back to the system interval for synthetic events. Double-click opening takes precedence over selection modifiers; a single click still selects or toggles selection. Fn does not block opening. Clicks stay keyed to a folder path across re-renders. Refreshes wait until a click sequence ends, and eight pixels of deliberate movement are required to begin dragging. Folder symlinks are browsable, file/application symlinks open with macOS, and broken links report an error.
+- Native double-click activation opens on the second press; its release is consumed to avoid opening twice. Synthetic events fall back to completed clicks within the system interval. Double-click opening takes precedence over selection modifiers; a single click still selects or toggles selection. Fn does not block opening. Clicks stay keyed to a folder path across re-renders. Refreshes wait until a click sequence ends, and eight pixels of deliberate movement are required to begin dragging. Folder symlinks are browsable, file/application symlinks open with macOS, and broken links report an error.
 - Immediate filename filtering; Enter in search performs a cancellable recursive search with a 10,000-result cap. Directory symlinks are not traversed.
 - New folders and empty files; rename; duplicate; recursive copy and move, including cross-volume moves.
 - File URL clipboard interoperability with Finder, plus an internal cut clipboard.
@@ -43,6 +43,7 @@ The bundle script builds a release binary, generates a Retina app icon, includes
 - ZIP compression through macOS `ditto`, staged before exclusive publication. ZIP extraction opens Archive Utility.
 - In-app media windows on double-click or Enter, backed by macOS frameworks in the same process. Image files get zoom, fit, Retina-aware actual size, pinch/pan, GIF animation, and previous/next image navigation. Videos get native play/pause, scrubbing, volume, frame stepping, full-screen controls, ten-second skips, and looping. PDFs get continuous scrolling, page navigation, zoom/fit, text selection/copy, search, and a password prompt for locked documents.
 - Open externally in the context menu or media toolbar, plus Quick Look, Finder reveal, and Terminal integration. Closing a video window pauses playback; viewer windows can stay open after the file-manager window closes.
+- The Terminal command opens the selected folder, a selected file's containing folder, or the current folder when there is no single selection. The background menu always opens the current folder. Folder symlinks resolve to their target. Launching runs on a worker thread and reports failures; paths are passed as arguments without shell interpolation.
 - File properties, image/text preview, operation status and cancellation, light/dark themes, and saved tabs/preferences.
 - Background directory loading/search/transfers. The active folder refreshes every three seconds when idle. Stale results from earlier navigations are discarded.
 - Native text input integration with UTF-16/UTF-8 conversion, IME composition, selection, and text copy/paste.
@@ -92,7 +93,7 @@ The rendered-row regression tests exercise real GPUI layout and event dispatch w
 ./scripts/test-ui.sh --offline
 ```
 
-These tests reproduce the old Fn-flag failure and cover list/grid activation, native/synthetic click counts, single-click selection, already-selected and multiply-selected folders, selection modifiers, Enter, folder symlinks, pointer jitter, and New/Sort/View menu actions. The ordinary test command uses unmodified GPUI test support. Offline preparation uses the cached GPUI source and replaces only diagnostic backtraces with `std::backtrace`, while disabling unused Git utilities; input, layout, rendering, and application code are unchanged. Offline adapters stay under ignored `target/` and are never linked into the app. Tests do not write the user's saved preferences.
+These tests reproduce the old Fn-flag failure and cover list/grid activation, native/synthetic click counts, interrupted second releases, single-click selection, already-selected and multiply-selected folders, selection modifiers, Enter, folder symlinks, pointer jitter, Terminal availability/target selection, and New/Sort/View menu actions. The ordinary test command uses unmodified GPUI test support. Offline preparation uses the cached GPUI source and replaces only diagnostic backtraces with `std::backtrace`, while disabling unused Git utilities; input, layout, rendering, and application code are unchanged. Offline adapters stay under ignored `target/` and are never linked into the app. Tests do not write the user's saved preferences.
 
 Before a release, manually validate the window on macOS: tabs/history, multi-selection, internal and Finder file drops, clipboard interoperability, IME, previews, permission-denied folders, native Trash/undo, large transfers/cancellation, image zoom/navigation, video playback/seek/loop/full screen, PDF search/unlock/text copy, and window closure during an operation. These interactive checks are outstanding.
 
@@ -108,7 +109,7 @@ Preferences live at `~/Library/Application Support/Explorer/session`. Tabs, pins
 
 - `src/app.rs`: GPUI views, navigation, menus, selection, async event routing.
 - `src/input.rs`, `src/text.rs`: native text input and Unicode range handling.
-- `src/interaction.rs`: completed-click activation and pointer/drag regression tests.
+- `src/interaction.rs`: native/synthetic click activation and pointer/drag regression tests.
 - `src/fs.rs`: dependency-free filesystem engine and unit tests.
 - `src/jobs.rs`: background operations and undo bookkeeping.
 - `src/native.rs`, `native/macos.m`: macOS integrations and file clipboard bridge.

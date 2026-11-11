@@ -17,6 +17,7 @@ struct PointerPress {
 pub struct RowClicks {
     last: Option<Press>,
     pointer: Option<PointerPress>,
+    activated_press: Option<(usize, PathBuf)>,
     interval: Duration,
 }
 impl Default for RowClicks {
@@ -29,12 +30,14 @@ impl RowClicks {
         Self {
             last: None,
             pointer: None,
+            activated_press: None,
             interval,
         }
     }
     pub fn clear(&mut self) {
         self.last = None;
         self.pointer = None;
+        self.activated_press = None;
     }
     pub fn release(&mut self) {
         self.pointer = None;
@@ -52,6 +55,9 @@ impl RowClicks {
         let Some(pointer) = self.pointer.as_mut() else {
             return false;
         };
+        if self.activated_press.is_some() {
+            return true;
+        }
         if pointer.dragging {
             return false;
         }
@@ -63,15 +69,43 @@ impl RowClicks {
         false
     }
     pub fn begin_press(&mut self, position: (f32, f32)) {
+        self.activated_press = None;
         self.pointer = Some(PointerPress {
             origin: position,
             dragging: false,
         });
     }
-    /// Activation follows completed clicks, the same event that selects a row.
-    /// Fn and pointer motion do not change which path a completed click targets.
+    /// Cocoa identifies a native double-click on the second down event. Open
+    /// immediately so a drag, focus change, or lost up event cannot swallow it.
+    pub fn native_press(&mut self, tab: usize, path: &Path, count: usize) -> bool {
+        let same_item = self
+            .last
+            .as_ref()
+            .is_none_or(|last| last.tab == tab && last.path == path);
+        if count < 2 || count % 2 != 0 || !same_item {
+            return false;
+        }
+        self.last = None;
+        self.activated_press = Some((tab, path.to_path_buf()));
+        true
+    }
+    pub fn consume_native_release(&mut self, tab: usize, path: &Path) -> bool {
+        let consumed = self
+            .activated_press
+            .take()
+            .is_some_and(|(pressed_tab, pressed_path)| pressed_tab == tab && pressed_path == path);
+        if consumed {
+            self.release();
+        }
+        consumed
+    }
+    /// Completed clicks select rows and provide a fallback for synthetic input.
+    /// A release after native press activation must never open the item twice.
     pub fn complete(&mut self, tab: usize, path: &Path, now: Instant, native_count: usize) -> bool {
         self.release();
+        if self.consume_native_release(tab, path) {
+            return false;
+        }
         let same_item = self
             .last
             .as_ref()
@@ -100,6 +134,34 @@ mod tests {
     use super::*;
     fn path() -> &'static Path {
         Path::new("/tmp/folder")
+    }
+    #[test]
+    fn native_press_is_consumed_before_release_and_triple_click() {
+        let mut clicks = RowClicks::default();
+        let now = Instant::now();
+        clicks.begin_press((20., 20.));
+        assert!(!clicks.native_press(1, path(), 1));
+        assert!(!clicks.complete(1, path(), now, 1));
+        clicks.begin_press((20., 20.));
+        assert!(clicks.native_press(1, path(), 2));
+        assert!(
+            clicks.suppress_drag_motion((50., 50.)),
+            "opening cannot also start a drag"
+        );
+        assert!(!clicks.complete(1, path(), now, 2));
+        clicks.begin_press((20., 20.));
+        assert!(!clicks.native_press(1, path(), 3));
+        assert!(!clicks.complete(1, path(), now, 3));
+        clicks.begin_press((20., 20.));
+        assert!(clicks.native_press(1, path(), 4));
+    }
+    #[test]
+    fn native_press_cannot_activate_a_different_row() {
+        let mut clicks = RowClicks::default();
+        clicks.complete(1, path(), Instant::now(), 1);
+        clicks.begin_press((20., 20.));
+        assert!(!clicks.native_press(1, Path::new("/tmp/other"), 2));
+        assert!(!clicks.native_press(2, path(), 2));
     }
     #[test]
     fn synthetic_double_click_does_not_need_release_counts() {

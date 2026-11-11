@@ -1,12 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-mkdir -p target/offline
-rustc --edition=2024 --test src/lib.rs -o target/offline/core-tests
-target/offline/core-tests
-clang -fobjc-arc -fmodules -fmodules-cache-path="$PWD/target/offline/modules" -mmacosx-version-min=12.0 -c native/macos.m -o target/offline/macos.o
-clang -fobjc-arc -fmodules -fmodules-cache-path="$PWD/target/offline/modules" -mmacosx-version-min=12.0 -c native/media.m -o target/offline/media.o
-ar rcs target/offline/libexplorer_native.a target/offline/macos.o target/offline/media.o
-rustc --edition=2024 --crate-name explorer --crate-type rlib src/lib.rs -o target/offline/libexplorer.rlib
-rustc --edition=2024 --test tests/operations.rs --extern explorer=target/offline/libexplorer.rlib -L native=target/offline -l static=explorer_native -l framework=AppKit -l framework=Foundation -l framework=AVKit -l framework=AVFoundation -l framework=PDFKit -l framework=CoreMedia -o target/offline/operation-tests
-target/offline/operation-tests
+test_output="${EXPLORER_TEST_OUTPUT_DIR:-$PWD/target/offline}"
+mkdir -p "$test_output"
+rustc --edition=2024 --test src/lib.rs -o "$test_output/core-tests"
+"$test_output/core-tests"
+rustc --edition=2024 --crate-name explorer --crate-type rlib src/lib.rs -o "$test_output/libexplorer.rlib"
+rustc --edition=2024 --test tests/jobs.rs --extern "explorer=$test_output/libexplorer.rlib" -o "$test_output/job-tests"
+"$test_output/job-tests"
+clang -fobjc-arc -fmodules -fmodules-cache-path="$test_output/modules" -mmacosx-version-min=12.0 -c native/macos.m -o "$test_output/macos.o"
+clang -fobjc-arc -fmodules -fmodules-cache-path="$test_output/modules" -mmacosx-version-min=12.0 -c native/media.m -o "$test_output/media.o"
+ar rcs "$test_output/libexplorer_native.a" "$test_output/macos.o" "$test_output/media.o"
+rustc --edition=2024 --test tests/operations.rs --extern "explorer=$test_output/libexplorer.rlib" -L "native=$test_output" -l static=explorer_native -l framework=AppKit -l framework=Foundation -l framework=AVKit -l framework=AVFoundation -l framework=PDFKit -l framework=CoreMedia -o "$test_output/operation-tests"
+"$test_output/operation-tests"

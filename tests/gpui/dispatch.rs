@@ -134,6 +134,183 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+fn file_entries(path: &std::path::Path, names: &[&str]) -> Vec<Entry> {
+    names
+        .iter()
+        .map(|name| {
+            let file = path.join(name);
+            std::fs::write(&file, name).unwrap();
+            Entry::read(file).unwrap()
+        })
+        .collect()
+}
+#[gpui::test]
+fn shift_selection_keeps_its_anchor_path_after_sorting(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    let entries = file_entries(&f.path, &["a", "b", "c", "d"]);
+    let view = f.view.clone();
+    let expected: std::collections::HashSet<PathBuf> =
+        [f.path.join("a"), f.path.join("b")].into_iter().collect();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tab_mut().entries = entries;
+            view.rebuild(cx);
+            view.select(0, Modifiers::none(), cx);
+            view.descending = true;
+            view.rebuild(cx);
+            view.select(
+                2,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::none()
+                },
+                cx,
+            );
+            assert_eq!(view.tab().selected, expected);
+        })
+    });
+}
+#[gpui::test]
+fn shift_selection_anchor_survives_a_refreshed_listing(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    let entries = file_entries(&f.path, &["a", "b", "c", "d"]);
+    let refreshed = file_entries(&f.path, &["a", "aa", "b", "c", "d"]);
+    let expected: std::collections::HashSet<PathBuf> =
+        [f.path.join("b"), f.path.join("c"), f.path.join("d")]
+            .into_iter()
+            .collect();
+    let view = f.view.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tab_mut().entries = entries;
+            view.rebuild(cx);
+            view.select(1, Modifiers::none(), cx);
+            view.tx
+                .send(super::Message::Loaded {
+                    tab: view.tab().id,
+                    revision: view.tab().revision,
+                    result: Ok(super::Listing {
+                        entries: refreshed,
+                        ..Default::default()
+                    }),
+                })
+                .unwrap();
+            view.poll(cx);
+            view.select(
+                4,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::none()
+                },
+                cx,
+            );
+            assert_eq!(view.tab().selected, expected);
+        })
+    });
+}
+#[gpui::test]
+fn arrow_navigation_follows_the_selected_path_after_sorting(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    let entries = file_entries(&f.path, &["a", "b", "c", "d"]);
+    let view = f.view.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tab_mut().entries = entries;
+            view.rebuild(cx);
+            view.select(0, Modifiers::none(), cx);
+            view.descending = true;
+            view.rebuild(cx);
+        })
+    });
+    f.visual.simulate_keystrokes("up");
+    f.visual.read(|cx| {
+        assert_eq!(
+            f.view.read(cx).tab().selected,
+            [f.path.join("b")].into_iter().collect()
+        )
+    });
+}
+#[gpui::test]
+fn failed_cut_can_retry_without_overwriting_a_newer_clipboard(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    let source = f.expected.clone();
+    let view = f.view.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, _| {
+            view.clipboard_version = 41;
+            view.cut = true;
+            view.clipboard = vec![source.clone()];
+            view.finish_cut(41, 41, vec![source.clone()]);
+            assert!(view.cut);
+            assert_eq!(view.clipboard, [source.clone()]);
+            view.clipboard_version = 42;
+            view.finish_cut(41, 41, vec![]);
+            assert!(view.cut);
+            assert_eq!(view.clipboard, [source.clone()]);
+            view.finish_cut(42, 43, vec![source]);
+            assert!(!view.cut);
+            assert!(view.clipboard.is_empty());
+        })
+    });
+}
+#[gpui::test]
+fn trash_controls_render_and_cancelling_permanent_deletion_keeps_the_item(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    let item = explorer::trash::Item::read(
+        &f.expected,
+        std::slice::from_ref(&f.path),
+        &Default::default(),
+    )
+    .unwrap();
+    let selected = f.expected.clone();
+    let view = f.view.clone();
+    f.visual.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.tab_mut().path = explorer::trash::home_root();
+            view.tab_mut().selected.insert(selected);
+            view.modal = Some(Modal::DeleteTrash {
+                items: vec![item],
+                empty: false,
+            });
+            cx.notify();
+        })
+    });
+    let cancel = f.point("modal-cancel");
+    f.click(cancel, Modifiers::none(), 1, false);
+    f.point("command-empty-trash");
+    let p = f.point("first-file-row");
+    f.visual.simulate_event(MouseDownEvent {
+        button: MouseButton::Right,
+        position: p,
+        modifiers: Modifiers::none(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    f.point("menu-restore-trash");
+    f.point("menu-delete-forever");
+    assert!(f.expected.exists());
+    f.visual
+        .read(|cx| assert!(f.view.read(cx).running.is_none()));
+}
+#[gpui::test]
+fn dropping_onto_trash_requests_confirmation_without_starting_a_copy(cx: &mut TestAppContext) {
+    let mut f = Fixture::new(cx, false, false);
+    let source = f.expected.clone();
+    let view = f.view.clone();
+    f.visual.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.drop_files(
+                vec![source.clone()],
+                explorer::trash::home_root(),
+                window,
+                cx,
+            );
+            assert!(matches!(&view.modal, Some(Modal::Trash(paths)) if paths == &[source]));
+            assert!(view.running.is_none());
+        })
+    });
+    assert!(f.expected.exists());
+}
 #[gpui::test]
 fn list_native_double_click_opens(cx: &mut TestAppContext) {
     let mut f = Fixture::new(cx, false, false);

@@ -4,3 +4,4 @@ pub mod interaction;
 pub mod media;
 pub mod session;
 pub mod text;
+pub mod trash;

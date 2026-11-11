@@ -123,14 +123,14 @@ pub fn expand_path(text: &str, current: &Path) -> PathBuf {
         if p.is_absolute() { p } else { current.join(p) }
     }
 }
-fn encode_path(p: &Path) -> String {
+pub(crate) fn encode_path(p: &Path) -> String {
     p.as_os_str()
         .as_bytes()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
 }
-fn decode_path(s: &str) -> Option<PathBuf> {
+pub(crate) fn decode_path(s: &str) -> Option<PathBuf> {
     if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }

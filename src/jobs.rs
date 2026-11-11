@@ -1,6 +1,8 @@
 use crate::native;
 use explorer::fs::{self, Change};
+use explorer::trash::{History, Item as TrashItem};
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{
         Arc,
@@ -10,6 +12,11 @@ use std::{
 };
 #[derive(Clone)]
 pub enum Job {
+    RestoreTrash {
+        items: Vec<TrashItem>,
+        destination: Option<PathBuf>,
+    },
+    DeleteTrash(Vec<TrashItem>),
     Transfer {
         paths: Vec<PathBuf>,
         destination: PathBuf,
@@ -38,6 +45,7 @@ pub enum JobEvent {
         errors: Vec<String>,
         summary: String,
         remaining_undo: Option<Vec<Change>>,
+        remaining_cut: Option<Vec<PathBuf>>,
     },
 }
 pub fn run(job: Job, cancel: Arc<AtomicBool>, tx: Sender<JobEvent>) {
@@ -45,6 +53,9 @@ pub fn run(job: Job, cancel: Arc<AtomicBool>, tx: Sender<JobEvent>) {
     let mut errors = vec![];
     let mut bytes = 0;
     let mut remaining = None;
+    let mut remaining_cut = None;
+    let mut completed_cut = HashSet::new();
+    let mut permanent_deletions = 0;
     let mut progress = |n| {
         bytes += n;
         let _ = tx.send(JobEvent::Progress {
@@ -53,17 +64,65 @@ pub fn run(job: Job, cancel: Arc<AtomicBool>, tx: Sender<JobEvent>) {
         });
     };
     let result: std::io::Result<()> = match job {
+        Job::RestoreTrash { items, destination } => {
+            for item in items {
+                if cancel.load(Ordering::Relaxed) {
+                    errors.push("Restore cancelled".into());
+                    break;
+                }
+                let target = destination
+                    .as_ref()
+                    .map(|directory| {
+                        directory.join(
+                            item.original
+                                .as_ref()
+                                .unwrap_or(&item.path)
+                                .file_name()
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .or(item.original.clone());
+                let Some(target) = target else {
+                    errors.push(format!(
+                        "{}: original location is unknown; use Restore to…",
+                        item.path.display()
+                    ));
+                    continue;
+                };
+                match item
+                    .restore(&target, &cancel, &mut progress)
+                    .and_then(|()| Change::moved(item.path.clone(), target))
+                {
+                    Ok(change) => changes.push(change),
+                    Err(error) => errors.push(format!("{}: {error}", item.path.display())),
+                }
+            }
+            Ok(())
+        }
+        Job::DeleteTrash(items) => {
+            for item in items {
+                if cancel.load(Ordering::Relaxed) {
+                    errors.push("Permanent deletion cancelled".into());
+                    break;
+                }
+                match item.delete_permanently() {
+                    Ok(()) => permanent_deletions += 1,
+                    Err(error) => errors.push(format!("{}: {error}", item.path.display())),
+                }
+            }
+            Ok(())
+        }
         Job::Transfer {
             paths,
             destination,
             cut,
         } => {
+            if cut {
+                remaining_cut = Some(paths.clone());
+            }
             for path in paths {
                 if cancel.load(Ordering::Relaxed) {
-                    errors.push(
-                        "Cancelled. Completed items were kept; unfinished copies were removed."
-                            .into(),
-                    );
+                    errors.push("Cancelled. Completed items were kept.".into());
                     break;
                 }
                 if cut
@@ -78,19 +137,17 @@ pub fn run(job: Job, cancel: Arc<AtomicBool>, tx: Sender<JobEvent>) {
                 }
                 let name = path.file_name().unwrap_or_default();
                 // Every collision gets a distinct name. Existing items are never replaced or merged.
-                let target = fs::unique_path(&destination, name);
-                let r = if cut {
-                    fs::move_item(&path, &target, &cancel, &mut progress)
-                } else {
-                    fs::copy(&path, &target, &cancel, &mut progress)
-                };
-                match r.and_then(|_| {
+                let result = fs::unique_path(&destination, name, &cancel).and_then(|target| {
                     if cut {
+                        fs::move_item(&path, &target, &cancel, &mut progress)?;
+                        completed_cut.insert(path.clone());
                         Change::moved(path.clone(), target)
                     } else {
+                        fs::copy(&path, &target, &cancel, &mut progress)?;
                         Change::created(target)
                     }
-                }) {
+                });
+                match result {
                     Ok(c) => changes.push(c),
                     Err(e) => errors.push(format!("{}: {e}", path.display())),
                 }
@@ -103,7 +160,12 @@ pub fn run(job: Job, cancel: Arc<AtomicBool>, tx: Sender<JobEvent>) {
                     errors.push("Cancelled".into());
                     break;
                 }
-                match native::trash(&path).and_then(|to| Change::moved(path.clone(), to)) {
+                match native::trash(&path).and_then(|to| {
+                    if let Err(error) = History::remember_saved(&path, &to) {
+                        errors.push(format!("Could not save restore location: {error}"));
+                    }
+                    Change::moved(path.clone(), to)
+                }) {
                     Ok(c) => changes.push(c),
                     Err(e) => errors.push(format!("{}: {e}", path.display())),
                 }
@@ -132,8 +194,11 @@ pub fn run(job: Job, cancel: Arc<AtomicBool>, tx: Sender<JobEvent>) {
                 let target = fs::unique_path(
                     path.parent().unwrap_or(std::path::Path::new("/")),
                     name.as_ref(),
+                    &cancel,
                 );
-                match native::compress(&path, &target).and_then(|_| Change::created(target)) {
+                match target.and_then(|target| {
+                    native::compress(&path, &target).and_then(|_| Change::created(target))
+                }) {
                     Ok(c) => changes.push(c),
                     Err(e) => errors.push(format!("{}: {e}", path.display())),
                 }
@@ -157,9 +222,24 @@ pub fn run(job: Job, cancel: Arc<AtomicBool>, tx: Sender<JobEvent>) {
                     continue;
                 }
                 let r = if let Some(original) = &c.original {
-                    fs::move_item(&c.current, original, &cancel, &mut progress)
+                    fs::move_item(&c.current, original, &cancel, &mut progress).map(|()| {
+                        if explorer::trash::roots().iter().any(|root| {
+                            original
+                                .parent()
+                                .and_then(|p| std::fs::canonicalize(p).ok())
+                                == std::fs::canonicalize(root).ok()
+                        }) {
+                            if let Err(error) = History::remember_saved(&c.current, original) {
+                                errors.push(format!("Could not save restore location: {error}"));
+                            }
+                        }
+                    })
                 } else {
-                    native::trash(&c.current).map(|_| ())
+                    native::trash(&c.current).map(|to| {
+                        if let Err(error) = History::remember_saved(&c.current, &to) {
+                            errors.push(format!("Could not save restore location: {error}"));
+                        }
+                    })
                 };
                 if let Err(e) = r {
                     errors.push(format!("{}: {e}", c.current.display()));
@@ -184,14 +264,22 @@ pub fn run(job: Job, cancel: Arc<AtomicBool>, tx: Sender<JobEvent>) {
     } else {
         format!(
             "{} item{} completed",
-            changes.len(),
-            if changes.len() == 1 { "" } else { "s" }
+            changes.len() + permanent_deletions,
+            if changes.len() + permanent_deletions == 1 {
+                ""
+            } else {
+                "s"
+            }
         )
     };
+    if let Some(pending) = &mut remaining_cut {
+        pending.retain(|path| !completed_cut.contains(path));
+    }
     let _ = tx.send(JobEvent::Done {
         changes,
         errors,
         summary,
         remaining_undo: remaining,
+        remaining_cut,
     });
 }

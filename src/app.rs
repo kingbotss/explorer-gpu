@@ -8,6 +8,7 @@ use explorer::{
     fs::{self, Change, Entry, Listing, Sort},
     interaction::RowClicks,
     session::{self, Session},
+    trash::{self, History as TrashHistory, Item as TrashItem},
 };
 use gpui::{prelude::*, *};
 use std::{
@@ -69,8 +70,8 @@ struct Tab {
     position: usize,
     entries: Vec<Entry>,
     selected: HashSet<PathBuf>,
-    anchor: Option<usize>,
-    cursor: Option<usize>,
+    anchor: Option<PathBuf>,
+    cursor: Option<PathBuf>,
     query: String,
     recursive: bool,
     loading: bool,
@@ -128,6 +129,7 @@ struct SizeWorker {
     cancel: Arc<AtomicBool>,
 }
 struct Running {
+    cut_clipboard_version: Option<i64>,
     cancel: Arc<AtomicBool>,
     rx: Receiver<JobEvent>,
     label: String,
@@ -139,11 +141,16 @@ enum Modal {
     Create { parent: PathBuf, directory: bool },
     Rename(PathBuf),
     Trash(Vec<PathBuf>),
+    DeleteTrash { items: Vec<TrashItem>, empty: bool },
     Properties(Vec<Entry>),
     Help,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    RestoreTrash,
+    RestoreTrashTo,
+    DeleteForever,
+    EmptyTrash,
     FolderSizes,
     CancelSizes,
     Back,
@@ -349,7 +356,7 @@ impl Explorer {
                     this.rebuild(cx);
                 }
                 InputEvent::Submit => {
-                    if !this.tab().query.trim().is_empty() {
+                    if !this.tab().query.trim().is_empty() && !this.in_trash() {
                         this.tab_mut().recursive = true;
                         this.load(this.active, true, cx);
                     }
@@ -420,7 +427,9 @@ impl Explorer {
             tab.cancel.clone(),
         );
         std::thread::spawn(move || {
-            let result = if recursive {
+            let result = if path == trash::home_root() {
+                trash::list(&cancel)
+            } else if recursive {
                 fs::search(&path, &query, hidden, &cancel)
             } else {
                 fs::list(&path, hidden, &cancel)
@@ -486,6 +495,22 @@ impl Explorer {
             .map(|i| self.tab().entries[*i].path.clone())
             .collect();
         self.tab_mut().selected.retain(|p| existing.contains(p));
+        if self
+            .tab()
+            .anchor
+            .as_ref()
+            .is_some_and(|path| !existing.contains(path))
+        {
+            self.tab_mut().anchor = None;
+        }
+        if self
+            .tab()
+            .cursor
+            .as_ref()
+            .is_some_and(|path| !existing.contains(path))
+        {
+            self.tab_mut().cursor = None;
+        }
         self.update_preview(cx);
         cx.notify();
     }
@@ -599,16 +624,17 @@ impl Explorer {
             return;
         }
         let path = self.tab().entries[self.visible[index]].path.clone();
-        self.tab_mut().cursor = Some(index);
+        self.tab_mut().cursor = Some(path.clone());
         if self.tab().anchor.is_none() {
-            self.tab_mut().anchor = Some(index);
+            self.tab_mut().anchor = Some(path.clone());
         }
         if modifiers.shift {
             let anchor = self
                 .tab()
                 .anchor
-                .unwrap_or(index)
-                .min(self.visible.len().saturating_sub(1));
+                .as_ref()
+                .and_then(|anchor| self.row_index(self.tab().id, anchor))
+                .unwrap_or(index);
             let paths: Vec<_> = (anchor.min(index)..=anchor.max(index))
                 .map(|i| self.tab().entries[self.visible[i]].path.clone())
                 .collect();
@@ -618,13 +644,13 @@ impl Explorer {
             self.tab_mut().selected.extend(paths);
         } else if modifiers.platform {
             if !self.tab_mut().selected.remove(&path) {
-                self.tab_mut().selected.insert(path);
+                self.tab_mut().selected.insert(path.clone());
             }
-            self.tab_mut().anchor = Some(index);
+            self.tab_mut().anchor = Some(path);
         } else {
             self.tab_mut().selected.clear();
-            self.tab_mut().selected.insert(path);
-            self.tab_mut().anchor = Some(index);
+            self.tab_mut().selected.insert(path.clone());
+            self.tab_mut().anchor = Some(path);
         }
         self.update_preview(cx);
         cx.notify();
@@ -700,6 +726,10 @@ impl Explorer {
         }
     }
     fn open_entry(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        if self.in_trash() {
+            self.result(native::quick_look(&[entry.path.clone()]), cx);
+            return;
+        }
         self.trace(&format!("open {:?}", entry.path));
         match Entry::read_for_open(entry.path.clone()) {
             Ok(current) if current.navigable() => self.navigate(current.path, cx),
@@ -922,7 +952,15 @@ impl Explorer {
                             }
                             Err(e) => {
                                 t.entries.clear();
-                                t.issue = Some(format!("Unable to read {}: {e}", t.path.display()));
+                                t.issue = Some(
+                                    if t.path == trash::home_root()
+                                        && e.kind() == std::io::ErrorKind::PermissionDenied
+                                    {
+                                        "macOS denied access to Trash. Enable Explorer in System Settings → Privacy & Security → Full Disk Access, then Refresh.".into()
+                                    } else {
+                                        format!("Unable to read {}: {e}", t.path.display())
+                                    },
+                                );
                             }
                         }
                         if index == self.active {
@@ -965,8 +1003,15 @@ impl Explorer {
                     errors,
                     summary,
                     remaining_undo,
+                    remaining_cut,
                 } => {
-                    self.running = None;
+                    let cut_version = self
+                        .running
+                        .take()
+                        .and_then(|running| running.cut_clipboard_version);
+                    if let (Some(version), Some(pending)) = (cut_version, remaining_cut) {
+                        self.finish_cut(version, native::clipboard_version(), pending);
+                    }
                     self.cancel_sizes();
                     self.folder_sizes.clear();
                     if let Some(records) = remaining_undo {
@@ -1013,11 +1058,14 @@ impl Explorer {
             cx.notify();
             return;
         }
+        let cut_clipboard_version =
+            matches!(&job, Job::Transfer { cut: true, .. }).then_some(self.clipboard_version);
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let worker = std::thread::spawn(move || jobs::run(job, worker_cancel, tx));
         self.running = Some(Running {
+            cut_clipboard_version,
             cancel,
             rx,
             label: label.into(),
@@ -1032,6 +1080,17 @@ impl Explorer {
             self.notice = Some((e.to_string(), true));
             cx.notify();
         }
+    }
+    fn finish_cut(&mut self, started_version: i64, system_version: i64, pending: Vec<PathBuf>) {
+        if self.clipboard_version != started_version || !self.cut {
+            return;
+        }
+        self.clipboard = if system_version == started_version {
+            pending
+        } else {
+            vec![]
+        };
+        self.cut = !self.clipboard.is_empty();
     }
     fn show_modal(
         &mut self,
@@ -1088,6 +1147,7 @@ impl Explorer {
                 Job::Rename { path, name }
             }
             Modal::Trash(paths) => Job::Trash(paths),
+            Modal::DeleteTrash { items, .. } => Job::DeleteTrash(items),
             _ => {
                 self.close_modal(window, cx);
                 return;
@@ -1114,6 +1174,46 @@ impl Explorer {
         }
         self.tab().path.clone()
     }
+    fn in_trash(&self) -> bool {
+        self.tab().path == trash::home_root()
+    }
+    fn drop_files(
+        &mut self,
+        paths: Vec<PathBuf>,
+        destination: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if destination == trash::home_root() {
+            self.show_modal(Modal::Trash(paths), "", window, cx);
+        } else {
+            self.start(
+                Job::Transfer {
+                    paths,
+                    destination,
+                    cut: false,
+                },
+                "Copying files",
+                cx,
+            );
+        }
+    }
+    fn trash_items(&self, all: bool) -> std::io::Result<Vec<TrashItem>> {
+        if !self.in_trash() {
+            return Err(std::io::Error::other("Open Trash to manage deleted items"));
+        }
+        let history = TrashHistory::load(&TrashHistory::location());
+        let roots = trash::roots();
+        let entries = if all {
+            self.tab().entries.clone()
+        } else {
+            self.selected_entries()
+        };
+        entries
+            .into_iter()
+            .map(|entry| TrashItem::read(&entry.path, &roots, &history))
+            .collect()
+    }
     pub fn perform(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         let terminal_path = (action == Action::Terminal).then(|| self.terminal_path());
         let all_sizes = self
@@ -1125,6 +1225,10 @@ impl Explorer {
             && matches!(
                 action,
                 Action::Paste
+                    | Action::RestoreTrash
+                    | Action::RestoreTrashTo
+                    | Action::DeleteForever
+                    | Action::EmptyTrash
                     | Action::Duplicate
                     | Action::NewFolder
                     | Action::NewFile
@@ -1141,8 +1245,87 @@ impl Explorer {
             cx.notify();
             return;
         }
+        if self.in_trash()
+            && matches!(
+                action,
+                Action::NewFolder
+                    | Action::NewFile
+                    | Action::Rename
+                    | Action::Duplicate
+                    | Action::Paste
+                    | Action::Compress
+                    | Action::Extract
+            )
+        {
+            self.notice = Some(("Restore or delete items from Trash.".into(), true));
+            cx.notify();
+            return;
+        }
         let paths = self.selected();
         match action {
+            Action::RestoreTrash | Action::RestoreTrashTo => match self.trash_items(false) {
+                Ok(items) if !items.is_empty() => {
+                    if action == Action::RestoreTrash
+                        && items.iter().all(|item| item.original.is_some())
+                    {
+                        self.start(
+                            Job::RestoreTrash {
+                                items,
+                                destination: None,
+                            },
+                            "Restoring from Trash",
+                            cx,
+                        );
+                    } else {
+                        let picker = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some("Restore selected items here".into()),
+                        });
+                        cx.spawn(async move |this, cx| match picker.await {
+                            Ok(Ok(Some(paths))) => {
+                                if let Some(directory) = paths.into_iter().next() {
+                                    let _ = this.update(cx, |this, cx| {
+                                        this.start(
+                                            Job::RestoreTrash {
+                                                items,
+                                                destination: Some(directory),
+                                            },
+                                            "Restoring from Trash",
+                                            cx,
+                                        )
+                                    });
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.result(Err(std::io::Error::other(error.to_string())), cx)
+                                });
+                            }
+                            _ => {}
+                        })
+                        .detach();
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => self.result(Err(error), cx),
+            },
+            Action::DeleteForever | Action::EmptyTrash => {
+                match self.trash_items(action == Action::EmptyTrash) {
+                    Ok(items) if !items.is_empty() => self.show_modal(
+                        Modal::DeleteTrash {
+                            items,
+                            empty: action == Action::EmptyTrash,
+                        },
+                        "",
+                        window,
+                        cx,
+                    ),
+                    Ok(_) => self.notice = Some(("Trash is empty.".into(), false)),
+                    Err(error) => self.result(Err(error), cx),
+                }
+            }
             Action::FolderSizes => {
                 let entries = if let Some(Modal::Properties(entries)) = &self.modal {
                     entries.clone()
@@ -1271,10 +1454,6 @@ impl Explorer {
                         if cut { "Moving files" } else { "Copying files" },
                         cx,
                     );
-                    if cut {
-                        self.cut = false;
-                        self.clipboard.clear();
-                    }
                 } else {
                     self.notice = Some((
                         "Copy files in Explorer or Finder, then paste them here.".into(),
@@ -1306,7 +1485,9 @@ impl Explorer {
                 }
             }
             Action::Trash => {
-                if !paths.is_empty() {
+                if self.in_trash() {
+                    self.perform(Action::DeleteForever, window, cx);
+                } else if !paths.is_empty() {
                     self.show_modal(Modal::Trash(paths), "", window, cx);
                 }
             }
@@ -1533,8 +1714,13 @@ impl Explorer {
                         } else {
                             1
                         };
-                        let index = self.tab().cursor.unwrap_or(0).min(self.visible.len() - 1);
-                        let next = if self.tab().cursor.is_none() {
+                        let cursor = self
+                            .tab()
+                            .cursor
+                            .as_ref()
+                            .and_then(|path| self.row_index(self.tab().id, path));
+                        let index = cursor.unwrap_or(0);
+                        let next = if cursor.is_none() {
                             0
                         } else if k.key == "up" || k.key == "left" {
                             index.saturating_sub(step)
@@ -1542,9 +1728,6 @@ impl Explorer {
                             (index + step).min(self.visible.len() - 1)
                         };
                         self.select(next, m, cx);
-                        if !m.shift {
-                            self.tab_mut().anchor = Some(next);
-                        }
                         self.scroll.scroll_to_item(
                             if self.settings.grid { next / 4 } else { next },
                             ScrollStrategy::Center,
@@ -1594,6 +1777,9 @@ impl Explorer {
         let title: SharedString = label.to_owned().into();
         div()
             .id(("action", action as usize))
+            .when(action == Action::EmptyTrash, |d| {
+                d.debug_selector(|| "command-empty-trash".to_owned())
+            })
             .when(action == Action::Terminal, |d| {
                 d.debug_selector(|| "command-terminal".to_owned())
             })
@@ -1882,6 +2068,60 @@ impl Explorer {
         let p = self.palette();
         let n = self.tab().selected.len();
         let idle = self.running.is_none();
+        if self.in_trash() {
+            return div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .h(px(48.))
+                .flex_shrink_0()
+                .bg(rgb(p.bg))
+                .border_b_1()
+                .border_color(rgb(p.border))
+                .child(self.button(
+                    Action::RestoreTrash,
+                    "Restore",
+                    "undo",
+                    false,
+                    n > 0 && idle,
+                    cx,
+                ))
+                .child(self.button(
+                    Action::RestoreTrashTo,
+                    "Restore to…",
+                    "folder",
+                    false,
+                    n > 0 && idle,
+                    cx,
+                ))
+                .child(self.button(
+                    Action::DeleteForever,
+                    "Delete permanently",
+                    "trash",
+                    false,
+                    n > 0 && idle,
+                    cx,
+                ))
+                .child(self.button(
+                    Action::EmptyTrash,
+                    "Empty Trash",
+                    "trash",
+                    false,
+                    !self.tab().entries.is_empty() && idle,
+                    cx,
+                ))
+                .child(self.menu_button("Sort", "sort", MenuKind::Sort, cx))
+                .child(div().flex_1())
+                .child(self.button(
+                    Action::Preview,
+                    "Preview",
+                    "preview",
+                    self.settings.preview,
+                    true,
+                    cx,
+                ));
+        }
         let separator = || div().h(px(22.)).w(px(1.)).bg(rgb(p.border)).mx_2();
         div()
             .flex()
@@ -1983,29 +2223,13 @@ impl Explorer {
                 this.navigate(nav.clone(), cx);
                 this.focus.focus(window);
             }))
-            .on_drop(cx.listener(move |this, info: &DragFiles, _, cx| {
+            .on_drop(cx.listener(move |this, info: &DragFiles, window, cx| {
                 cx.stop_propagation();
-                this.start(
-                    Job::Transfer {
-                        paths: info.paths.clone(),
-                        destination: drop_to.clone(),
-                        cut: false,
-                    },
-                    "Copying files",
-                    cx,
-                );
+                this.drop_files(info.paths.clone(), drop_to.clone(), window, cx);
             }))
-            .on_drop(cx.listener(move |this, info: &ExternalPaths, _, cx| {
+            .on_drop(cx.listener(move |this, info: &ExternalPaths, window, cx| {
                 cx.stop_propagation();
-                this.start(
-                    Job::Transfer {
-                        paths: info.paths().to_vec(),
-                        destination: external_to.clone(),
-                        cut: false,
-                    },
-                    "Copying files",
-                    cx,
-                );
+                this.drop_files(info.paths().to_vec(), external_to.clone(), window, cx);
             }))
             .when(tree, |d| {
                 d.child(
@@ -2142,7 +2366,7 @@ impl Explorer {
                         self.sidebar_link(label, glyph, path, 0, true, cx)
                     }))
                     .child(self.sidebar_link(
-                        "Recycle Bin".into(),
+                        "Trash".into(),
                         "trash",
                         home.join(".Trash"),
                         0,
@@ -2364,8 +2588,10 @@ impl Explorer {
                     cx.notify();
                 }),
             )
-            .on_drag(drag, |info: &DragFiles, _, _, cx| cx.new(|_| info.clone()));
-        if navigable {
+            .when(!self.in_trash(), |row| {
+                row.on_drag(drag, |info: &DragFiles, _, _, cx| cx.new(|_| info.clone()))
+            });
+        if navigable && !self.in_trash() {
             row = row
                 .on_drop(cx.listener(move |this, info: &DragFiles, _, cx| {
                     cx.stop_propagation();
@@ -2510,27 +2736,13 @@ impl Explorer {
                     cx.notify();
                 }),
             )
-            .on_drop(cx.listener(|this, info: &DragFiles, _, cx| {
-                this.start(
-                    Job::Transfer {
-                        paths: info.paths.clone(),
-                        destination: this.tab().path.clone(),
-                        cut: false,
-                    },
-                    "Copying files",
-                    cx,
-                );
+            .on_drop(cx.listener(|this, info: &DragFiles, window, cx| {
+                cx.stop_propagation();
+                this.drop_files(info.paths.clone(), this.tab().path.clone(), window, cx);
             }))
-            .on_drop(cx.listener(|this, info: &ExternalPaths, _, cx| {
-                this.start(
-                    Job::Transfer {
-                        paths: info.paths().to_vec(),
-                        destination: this.tab().path.clone(),
-                        cut: false,
-                    },
-                    "Copying files",
-                    cx,
-                );
+            .on_drop(cx.listener(|this, info: &ExternalPaths, window, cx| {
+                cx.stop_propagation();
+                this.drop_files(info.paths().to_vec(), this.tab().path.clone(), window, cx);
             }))
             .when(!self.tab().query.is_empty(), |d| {
                 d.child(self.folder_header(cx))
@@ -2973,6 +3185,38 @@ impl Explorer {
                     true,
                 ),
             ],
+            MenuKind::Background if self.in_trash() => vec![
+                (
+                    Action::EmptyTrash,
+                    "Empty Trash",
+                    "trash",
+                    "",
+                    idle && !self.tab().entries.is_empty(),
+                ),
+                (Action::Refresh, "Refresh", "refresh", "⌘R", true),
+                (Action::Reveal, "Show in Finder", "folder", "", true),
+            ],
+            MenuKind::Selection if self.in_trash() => vec![
+                (Action::RestoreTrash, "Restore", "undo", "", n > 0 && idle),
+                (
+                    Action::RestoreTrashTo,
+                    "Restore to…",
+                    "folder",
+                    "",
+                    n > 0 && idle,
+                ),
+                (Action::QuickLook, "Quick Look", "eye", "Space", n > 0),
+                (Action::Copy, "Copy", "copy", "⌘C", n > 0),
+                (Action::Reveal, "Show in Finder", "folder", "", n > 0),
+                (Action::Properties, "Properties", "info", "⌘I", true),
+                (
+                    Action::DeleteForever,
+                    "Delete permanently",
+                    "trash",
+                    "⌘⌫",
+                    n > 0 && idle,
+                ),
+            ],
             MenuKind::Background => vec![
                 (Action::NewFolder, "New folder", "plus", "⇧⌘N", idle),
                 (Action::NewFile, "New file", "file", "", idle),
@@ -3075,6 +3319,12 @@ impl Explorer {
                                 .when(action == Action::FolderSizes, |d| {
                                     d.debug_selector(|| "menu-folder-sizes".to_owned())
                                 })
+                                .when(action == Action::RestoreTrash, |d| {
+                                    d.debug_selector(|| "menu-restore-trash".to_owned())
+                                })
+                                .when(action == Action::DeleteForever, |d| {
+                                    d.debug_selector(|| "menu-delete-forever".to_owned())
+                                })
                                 .flex()
                                 .items_center()
                                 .gap_3()
@@ -3084,11 +3334,16 @@ impl Explorer {
                                 .rounded_md()
                                 .text_size(px(12.))
                                 .cursor_pointer()
-                                .text_color(rgb(if action == Action::Trash {
-                                    0xd76868
-                                } else {
-                                    p.text
-                                }))
+                                .text_color(rgb(
+                                    if matches!(
+                                        action,
+                                        Action::Trash | Action::DeleteForever | Action::EmptyTrash
+                                    ) {
+                                        0xd76868
+                                    } else {
+                                        p.text
+                                    },
+                                ))
                                 .when(!enabled, |d| d.opacity(0.35).cursor_default())
                                 .when(enabled, |d| {
                                     d.hover(move |s| s.bg(rgb(p.hover))).on_click(cx.listener(
@@ -3136,6 +3391,16 @@ impl Explorer {
                 "Move to Trash?",
                 "You can undo this operation or restore the items from Trash.",
                 "Move to Trash",
+            ),
+            Modal::DeleteTrash { empty: true, .. } => (
+                "Empty Trash?",
+                "Permanently delete the listed items. This cannot be undone.",
+                "Empty Trash",
+            ),
+            Modal::DeleteTrash { .. } => (
+                "Delete permanently?",
+                "These items will be permanently deleted. This cannot be undone.",
+                "Delete permanently",
             ),
             Modal::Properties(_) => ("Properties", "File information on this Mac.", "Done"),
             Modal::Help => (
@@ -3186,6 +3451,26 @@ impl Explorer {
                         d.child(format!("and {} more items", paths.len() - 6))
                     });
             }
+            Modal::DeleteTrash { items, .. } => {
+                content = content
+                    .child(format!(
+                        "{} item{}",
+                        items.len(),
+                        if items.len() == 1 { "" } else { "s" }
+                    ))
+                    .children(items.iter().take(6).map(|item| {
+                        div().child(
+                            item.path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                    }))
+                    .when(items.len() > 6, |d| {
+                        d.child(format!("and {} more items", items.len() - 6))
+                    });
+            }
             Modal::Properties(entries) => {
                 if entries.len() == 1 {
                     let e = &entries[0];
@@ -3205,6 +3490,16 @@ impl Explorer {
                             std::fs::read_link(&e.path)
                                 .map(|p| p.to_string_lossy().into_owned())
                                 .unwrap_or_else(|_| "Unavailable".into()),
+                            p,
+                        ));
+                    }
+                    if self.in_trash() {
+                        content = content.child(detail(
+                            "Original location",
+                            TrashHistory::load(&TrashHistory::location())
+                                .original(&e.path)
+                                .map(|path| path.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "Unknown · choose Restore to…".into()),
                             p,
                         ));
                     }
@@ -3332,6 +3627,7 @@ impl Explorer {
                                     d.child(
                                         div()
                                             .id("modal-cancel")
+                                            .debug_selector(|| "modal-cancel".to_owned())
                                             .px_4()
                                             .py_2()
                                             .rounded_md()
@@ -3353,11 +3649,16 @@ impl Explorer {
                                         .rounded_md()
                                         .cursor_pointer()
                                         .text_color(rgb(0xffffff))
-                                        .bg(rgb(if matches!(modal, Modal::Trash(_)) {
-                                            0xc75959
-                                        } else {
-                                            p.accent
-                                        }))
+                                        .bg(rgb(
+                                            if matches!(
+                                                modal,
+                                                Modal::Trash(_) | Modal::DeleteTrash { .. }
+                                            ) {
+                                                0xc75959
+                                            } else {
+                                                p.accent
+                                            },
+                                        ))
                                         .child(confirm)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.submit_modal(window, cx)
@@ -3575,7 +3876,9 @@ impl Drop for Explorer {
     }
 }
 fn display_name(path: &Path) -> String {
-    if path == session::home() {
+    if path == trash::home_root() {
+        "Trash".into()
+    } else if path == session::home() {
         "Home".into()
     } else if path == Path::new("/") {
         "Macintosh HD".into()

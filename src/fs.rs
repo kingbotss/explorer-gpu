@@ -1,14 +1,14 @@
 #[cfg(unix)]
 use std::os::unix::{
     ffi::OsStrExt,
-    fs::{MetadataExt, PermissionsExt, symlink},
+    fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink},
 };
 use std::{
     cmp::Ordering,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -338,25 +338,36 @@ pub fn create(parent: &Path, name: &str, directory: bool) -> io::Result<PathBuf>
     }
     Ok(path)
 }
-pub fn unique_path(parent: &Path, name: &std::ffi::OsStr) -> PathBuf {
+pub fn unique_path(
+    parent: &Path,
+    name: &std::ffi::OsStr,
+    cancel: &AtomicBool,
+) -> io::Result<PathBuf> {
+    cancelled(cancel)?;
     let path = parent.join(name);
-    if fs::symlink_metadata(&path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
-        return path;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(path),
+        Err(error) => return Err(error),
+        Ok(_) => {}
     }
     let p = Path::new(name);
-    let stem = p.file_stem().unwrap_or(name).to_string_lossy();
-    let ext = p
-        .extension()
-        .map(|s| format!(".{}", s.to_string_lossy()))
-        .unwrap_or_default();
     for n in 1.. {
-        let candidate = parent.join(if n == 1 {
-            format!("{stem} copy{ext}")
+        cancelled(cancel)?;
+        let mut candidate = p.file_stem().unwrap_or(name).to_os_string();
+        candidate.push(if n == 1 {
+            " copy".into()
         } else {
-            format!("{stem} copy {n}{ext}")
+            format!(" copy {n}")
         });
-        if fs::symlink_metadata(&candidate).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
-            return candidate;
+        if let Some(extension) = p.extension() {
+            candidate.push(".");
+            candidate.push(extension);
+        }
+        let candidate = parent.join(candidate);
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => return Err(error),
+            Ok(_) => {}
         }
     }
     unreachable!()
@@ -436,13 +447,100 @@ fn validate_transfer(from: &Path, to: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-fn remove_created(path: &Path) {
-    if let Ok(m) = fs::symlink_metadata(path) {
-        if m.is_dir() {
-            let _ = fs::remove_dir_all(path);
-        } else {
-            let _ = fs::remove_file(path);
+// This is used only inside a private staging directory, never on a public
+// destination or a source. Restore owner access before removing read-only trees.
+pub(crate) fn remove_private_tree(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
+        )?;
+        for child in fs::read_dir(path)? {
+            remove_private_tree(&child?.path())?;
         }
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+pub(crate) struct PrivateStage {
+    pub(crate) path: PathBuf,
+    identity: Identity,
+}
+impl PrivateStage {
+    pub(crate) fn new(parent: &Path, kind: &str) -> io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = parent.join(format!(
+                ".explorer-{kind}-{}-{stamp}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        identity: Identity::read(&path)?,
+                        path,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    pub(crate) fn cleanup(&self) -> io::Result<()> {
+        if fs::symlink_metadata(&self.path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            return Ok(());
+        }
+        if !self.identity.matches(&self.path) {
+            return Err(io::Error::other(format!(
+                "Temporary folder changed identity; preserved {}",
+                self.path.display()
+            )));
+        }
+        remove_private_tree(&self.path)
+    }
+}
+impl Drop for PrivateStage {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+pub(crate) struct DirectoryAccess {
+    file: File,
+    permissions: fs::Permissions,
+}
+impl DirectoryAccess {
+    pub(crate) fn acquire(path: &Path, expected: &Identity) -> io::Result<Option<Self>> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.permissions().mode() & 0o200 != 0 {
+            return Ok(None);
+        }
+        let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        if (Identity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }) != *expected
+        {
+            return Err(io::Error::other("Folder changed before moving"));
+        }
+        let permissions = metadata.permissions();
+        file.set_permissions(fs::Permissions::from_mode(permissions.mode() | 0o200))?;
+        Ok(Some(Self { file, permissions }))
+    }
+    pub(crate) fn restore(&self) -> io::Result<()> {
+        self.file.set_permissions(self.permissions.clone())
+    }
+}
+impl Drop for DirectoryAccess {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 fn copy_inner(
@@ -459,18 +557,14 @@ fn copy_inner(
     }
     if meta.is_dir() {
         fs::create_dir(to)?;
-        let result = (|| {
+        (|| {
             for item in fs::read_dir(from)? {
                 let item = item?;
                 copy_inner(&item.path(), &to.join(item.file_name()), cancel, progress)?;
             }
             fs::set_permissions(to, meta.permissions())?;
             Ok(())
-        })();
-        if result.is_err() {
-            remove_created(to);
-        }
-        result
+        })()
     } else if meta.is_file() {
         let mut source = File::open(from)?;
         let mut dest = OpenOptions::new().write(true).create_new(true).open(to)?;
@@ -492,10 +586,6 @@ fn copy_inner(
             dest.set_times(times)?;
             Ok(())
         })();
-        drop(dest);
-        if result.is_err() {
-            remove_created(to);
-        }
         result
     } else {
         Err(io::Error::new(
@@ -511,7 +601,39 @@ pub fn copy(
     mut progress: impl FnMut(u64),
 ) -> io::Result<()> {
     validate_transfer(from, to)?;
-    copy_inner(from, to, cancel, &mut progress)
+    cancelled(cancel)?;
+    match fs::symlink_metadata(to) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Destination already exists",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let stage = PrivateStage::new(
+        to.parent()
+            .ok_or_else(|| io::Error::other("Missing destination parent"))?,
+        "copy",
+    )?;
+    let payload = stage.path.join("item");
+    let result = copy_inner(from, &payload, cancel, &mut progress)
+        .and_then(|()| cancelled(cancel))
+        .and_then(|()| {
+            let _access = DirectoryAccess::acquire(&payload, &Identity::read(&payload)?)?;
+            rename_exclusive(&payload, to)
+        });
+    if let Err(error) = result {
+        if let Err(cleanup) = stage.cleanup() {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("{error}; cleanup failed: {cleanup}"),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 pub fn move_item(
     from: &Path,
@@ -537,8 +659,8 @@ pub fn move_item(
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
-    dev: u64,
-    ino: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
 }
 impl Identity {
     pub fn read(path: &Path) -> io::Result<Self> {
@@ -651,11 +773,120 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            let _ = remove_private_tree(&self.0);
         }
     }
     fn no() -> AtomicBool {
         AtomicBool::new(false)
+    }
+    fn assert_no_staging(parent: &Path) {
+        assert!(!fs::read_dir(parent).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".explorer-copy-")
+        }));
+    }
+    #[test]
+    fn cancellation_preserves_a_destination_created_by_another_writer() {
+        let f = Fixture::new();
+        fs::write(f.path("source"), vec![0; 2 * 1024 * 1024]).unwrap();
+        let cancel = no();
+        let result = copy(&f.path("source"), &f.path("destination"), &cancel, |_| {
+            fs::write(f.path("destination"), "independent data").unwrap();
+            cancel.store(true, AtomicOrdering::Relaxed);
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(
+            fs::read_to_string(f.path("destination")).unwrap(),
+            "independent data"
+        );
+        assert_no_staging(&f.0);
+    }
+    #[test]
+    fn a_readonly_root_folder_can_be_published_without_changing_its_mode() {
+        let f = Fixture::new();
+        let source = create(&f.0, "source", true).unwrap();
+        fs::write(source.join("file"), "contents").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        copy(&source, &f.path("destination"), &no(), |_| {}).unwrap();
+        assert_eq!(
+            fs::metadata(f.path("destination"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::read_to_string(f.path("destination/file")).unwrap(),
+            "contents"
+        );
+        assert_no_staging(&f.0);
+    }
+    #[test]
+    fn copy_publish_preserves_a_destination_created_during_transfer() {
+        let f = Fixture::new();
+        fs::write(f.path("source"), "copy data").unwrap();
+        let result = copy(&f.path("source"), &f.path("destination"), &no(), |_| {
+            fs::write(f.path("destination"), "independent data").unwrap();
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(f.path("destination")).unwrap(),
+            "independent data"
+        );
+        assert_no_staging(&f.0);
+    }
+    #[test]
+    fn cancelling_after_a_readonly_subtree_cleans_the_entire_partial_copy() {
+        let f = Fixture::new();
+        let source = create(&f.0, "source", true).unwrap();
+        fs::create_dir(source.join("one")).unwrap();
+        fs::create_dir(source.join("two")).unwrap();
+        let mut children = fs::read_dir(&source)
+            .unwrap()
+            .map(|entry| entry.unwrap().path());
+        let readonly = children.next().unwrap();
+        let later = children.next().unwrap();
+        fs::write(readonly.join("file"), [1]).unwrap();
+        fs::write(later.join("file"), vec![0; 2 * 1024 * 1024]).unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).unwrap();
+        let cancel = no();
+        let mut total = 0;
+        let result = copy(&source, &f.path("destination"), &cancel, |bytes| {
+            total += bytes;
+            if total > 1 {
+                cancel.store(true, AtomicOrdering::Relaxed);
+            }
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(!f.path("destination").exists());
+        assert_eq!(
+            fs::metadata(&readonly).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_no_staging(&f.0);
+    }
+    #[test]
+    fn unique_path_returns_permission_errors_and_honors_cancellation() {
+        let f = Fixture::new();
+        let locked = create(&f.0, "locked", true).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0)).unwrap();
+        let result = unique_path(&locked, "file".as_ref(), &no());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            unique_path(&f.0, "file".as_ref(), &AtomicBool::new(true))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
     }
     #[test]
     fn folder_size_includes_nested_and_hidden_files() {
@@ -867,12 +1098,12 @@ mod tests {
         let f = Fixture::new();
         symlink("missing", f.path("a.txt")).unwrap();
         assert_eq!(
-            unique_path(&f.0, std::ffi::OsStr::new("a.txt")),
+            unique_path(&f.0, std::ffi::OsStr::new("a.txt"), &no()).unwrap(),
             f.path("a copy.txt")
         );
         create(&f.0, "a copy.txt", false).unwrap();
         assert_eq!(
-            unique_path(&f.0, std::ffi::OsStr::new("a.txt")),
+            unique_path(&f.0, std::ffi::OsStr::new("a.txt"), &no()).unwrap(),
             f.path("a copy 2.txt")
         );
     }

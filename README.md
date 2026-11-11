@@ -2,11 +2,11 @@
 
 A native Rust + GPUI file manager with a Windows 11 Explorer-style interface: neutral surfaces, compact tabs and command bar, yellow folder icons, a navigation tree, details/grid views, and an optional preview pane. GPUI renders the interface directly; there is no browser or webview.
 
-**Status: initial implementation.** The full GPUI application passes `cargo check --all-targets` and builds in release mode. The 72 core/native-operation tests and 31 rendered GPUI event tests pass, and the signed app bundle is generated at `dist/Explorer.app`. The live input log exposed a 150 ms macOS double-click setting rejecting recorded 167–200 ms click pairs; replaying the timing in a rendered test reproduced the failure. Version 0.3.3 adds a 500 ms application minimum while preserving slower system preferences. The running 0.3.3 app's log subsequently confirmed folder activation and navigation from paired presses reported as single clicks. Full Windows Explorer/Finder feature parity is not claimed.
+**Source version 0.4.0 — app build pending.** This update fixes cancellation cleanup, inaccessible-destination retries, cleanup of read-only partial copies, selection anchors after sorting/refresh, and cut-paste retry state. It adds Trash restore, Restore to…, permanent deletion, and Empty Trash with confirmation. The 89 lightweight core, worker, and native-operation tests pass. The 37 GPUI regression tests are prepared but have not been run for this update; the full application has not been rebuilt at the user's request. Existing app/DMG files in `dist/` remain version 0.3.4 until rebuilt. Full Windows Explorer/Finder feature parity is not claimed.
 
 ## Run
 
-Version 0.3.4 places folder-size recalculation in Properties rather than the right-click menu. Folder sizes still calculate automatically when selected or opened in Properties; View → Calculate all folder sizes measures the listing, and sorting by Size also starts measurement. Folder presses pair using at least 500 ms, or the system interval if longer, independently of GPUI's click/drag callbacks. A bounded input log records the configured/effective intervals, actual event counts, and activation decisions. Quit any running copy and reopen `dist/Explorer.app` to load this version; the title bar and About Explorer show the version.
+Version 0.4.0 is ready for a later build. After building, Trash in the sidebar shows the user's Trash and accessible Trash folders on mounted volumes. Folder-size recalculation remains in Properties; selection still calculates automatically. Folder presses pair using at least 500 ms, or the system interval if longer. A bounded input log records the configured/effective intervals, actual event counts, and activation decisions. Quit the running copy and reopen the newly built app; the title bar and About Explorer show the version.
 
 Requires macOS 12+, a recent stable Rust toolchain (edition 2024), Xcode command-line tools, and internet access for the first dependency download. GPUI is pinned to 0.2.2 with its `runtime_shaders` feature: macOS compiles the embedded Metal shaders at launch, so the separate Xcode Metal compiler download is not required.
 
@@ -41,21 +41,21 @@ To create a drag-to-install DMG from the existing bundle:
 python3 scripts/dmg.py
 ```
 
-Open `dist/Explorer-0.3.4-macOS.dmg` and drag Explorer onto Applications. The script verifies the app and image, includes an Applications shortcut, and does not run Cargo or require the build cache.
+Open the versioned DMG generated in `dist/` and drag Explorer onto Applications. The script verifies the app and image, includes an Applications shortcut, and does not run Cargo or require the build cache. It packages the existing bundle, so run `scripts/bundle.sh` first when updating the app's source.
 
 ## Implemented in the source
 
 - Independent tabs with back/forward history; breadcrumbs, editable paths, `~` expansion, and parent navigation.
 - Expandable folder tree, common macOS locations, mounted volumes, iCloud Drive when present, and persistent folder pins.
 - Virtualized details and four-column grid views; natural filename sorting; sortable name/date/kind/size columns; folders first; hidden-file toggle.
-- Single, Command-click, Shift-click, keyboard, and select-all selection.
+- Single, Command-click, Shift-click, keyboard, and select-all selection. Anchor/cursor paths survive sorting and refreshed listings, so ranges and arrow navigation keep following the same item.
 - A capture-phase handler checks the visible, clipped row bounds and opens on the second press. It accepts native double-click counts and independently pairs synthetic presses within at least 500 ms (longer system preferences are honored), even without completed-click callbacks. Double-click opening takes precedence over selection modifiers; a single click still selects or toggles selection. Fn does not block opening. Clicks stay keyed to a folder path across re-renders. Refreshes wait until a click sequence ends, and eight pixels of deliberate movement are required to begin dragging. Folder symlinks are browsable, file/application symlinks open with macOS, and broken links report an error.
 - Recursive folder sizes appear in the Size column, grid, preview, Properties, and selected-item totals. One background worker measures selected folders; Properties offers recalculation and cancellation, and View can measure the whole listing. Sorting by Size starts measurement and delays row movement until the current click sequence ends. View → Cancel size calculation stops pending work, and navigating away cancels it automatically. Hidden files count; internal symlinks contribute their own link length and are never traversed. A selected root symlink resolves to its folder target. Totals use logical file lengths, count hard links per directory entry, and exclude directory metadata. Partial results show unreadable entries; explicit Refresh discards cached measurements.
 - Immediate filename filtering; Enter in search performs a cancellable recursive search with a 10,000-result cap. Directory symlinks are not traversed.
-- New folders and empty files; rename; duplicate; recursive copy and move, including cross-volume moves.
-- File URL clipboard interoperability with Finder, plus an internal cut clipboard.
+- New folders and empty files; rename; duplicate; recursive copy and move, including cross-volume moves. Copies are assembled in a private temporary directory and published with an exclusive rename; cancellation never cleans a public destination, and read-only partial trees can be removed. Filename collision searches return access errors and honor cancellation.
+- File URL clipboard interoperability with Finder, plus an internal cut clipboard. Failed/cancelled moves retain the unmoved sources for retry; completion does not overwrite a newer clipboard.
 - Internal drag-and-drop copying to folders/sidebar locations, and files dropped from Finder. Dragging out into another app is not implemented.
-- Native macOS Trash with confirmation. The application has no permanent-delete command.
+- Native macOS Trash with confirmation and persistent restore history for Explorer-deleted items. Trash has Restore, Restore to…, Delete permanently, and Empty Trash controls. Permanent deletion always requires confirmation and checks the selected items' identities and Trash roots. Empty Trash deletes the confirmed snapshot and keeps later arrivals. Read-only folders are supported, and symlinks are removed without following their targets. Double-clicking a trashed item previews it with Quick Look.
 - Session-local undo for successful creates, copies, renames, moves, compression, and Trash operations. Undo verifies file identity and never overwrites a recreated original. Undoing creation/copy moves the result to Trash.
 - ZIP compression through macOS `ditto`, staged before exclusive publication. ZIP extraction opens Archive Utility.
 - In-app media windows on double-click or Enter, backed by macOS frameworks in the same process. Image files get zoom, fit, Retina-aware actual size, pinch/pan, GIF animation, and previous/next image navigation. Videos get native play/pause, scrubbing, volume, frame stepping, full-screen controls, ten-second skips, and looping. PDFs get continuous scrolling, page navigation, zoom/fit, text selection/copy, search, and a password prompt for locked documents.
@@ -92,7 +92,7 @@ Run the core and native operation tests without downloading any crates:
 ./scripts/test-offline.sh
 ```
 
-The core and native tests create isolated temporary directories. They cover exclusive creation/copy/move/rename, cancellation cleanup, descendant-copy rejection, symlink preservation and loops, search, natural sorting, Unicode text and settings, partial batch failures, undo conflicts and identity checks, real ZIP compression, media classification, and valid/invalid image and PDF decoding through the actual native loaders. They do not exercise a live macOS window, video playback, system clipboard, native Trash, or Quick Look.
+The core, worker, and native tests create isolated temporary directories. They cover exclusive creation/copy/move/rename, cancellation and concurrent destination replacement, read-only cleanup, inaccessible destinations, descendant-copy rejection, symlink preservation and loops, search, natural sorting, Unicode text and settings, partial/cancelled cut batches, undo conflicts and identity checks, Trash restore/history, restore collisions, permanent deletion limited to selected test items, real ZIP compression, media classification, and valid/invalid image and PDF decoding. They never delete from the user's real Trash. Live native Trash, clipboard, Quick Look, and media controls require interactive validation. To keep test output outside the project, set `EXPLORER_TEST_OUTPUT_DIR` to a temporary directory when running the offline script.
 
 With dependency access, also run:
 
@@ -116,7 +116,7 @@ Before a release, manually validate the window on macOS: tabs/history, multi-sel
 
 ## Current limits
 
-This is a substantial first version, not complete Windows Explorer parity. Windows-style labels are adapted to the Mac: This PC browses `/`, Network & volumes browses `/Volumes`, and Recycle Bin uses macOS Trash. Missing features include editable permissions/ACLs, Finder tags, batch rename, column resizing, content/Spotlight search, thumbnail caching, native drag export, direct SMB/SFTP connections, a merge/replace conflict dialog, persistent undo, and crash-resumable transfers. Mounted network volumes can be browsed through `/Volumes`. macOS controls access to protected folders; inaccessible items are reported.
+This is a substantial first version, not complete Windows Explorer parity. This PC browses `/`, Network & volumes browses `/Volumes`, and Trash aggregates accessible user Trash folders. Original locations are recorded for items deleted through Explorer; items deleted by Finder/other apps or records older than the bounded 4,096-entry history use Restore to… to choose a destination. macOS may require Full Disk Access for Trash browsing; an access error explains how to enable it. Missing features include editable permissions/ACLs, Finder tags, batch rename, column resizing, content/Spotlight search, thumbnail caching, native drag export, direct SMB/SFTP connections, a merge/replace conflict dialog, persistent undo, and crash-resumable transfers. Mounted network volumes can be browsed through `/Volumes`.
 
 Media decoding and playback use the formats/codecs available in macOS; unsupported or damaged media reports an error, and Open externally remains available. Native media window controls and live playback still require interactive validation. Dates are shown in UTC. Text previews read at most 32 KB. Text cursor movement follows Unicode scalar boundaries rather than full grapheme clusters. ZIP extraction is delegated to Archive Utility and is not tracked in the application's undo stack. Cancellation is cooperative; compression and native Trash finish their current item before stopping. Normal app closure waits for the active worker to clean up; force-killing a process may leave an incomplete copy. If removal of a source fails during a cross-volume move, the completed destination copy is retained and an error is shown.
 
@@ -131,11 +131,13 @@ For the ongoing double-click investigation, `~/Library/Application Support/Explo
 - `src/interaction.rs`: native/synthetic click activation and pointer/drag regression tests.
 - `src/fs.rs`: dependency-free filesystem engine and unit tests.
 - `src/jobs.rs`: background operations and undo bookkeeping.
+- `src/trash.rs`: scoped restore/permanent deletion, mounted-volume Trash listing, and persistent original-location history.
 - `src/native.rs`, `native/macos.m`: macOS integrations and file clipboard bridge.
 - `src/media.rs`, `native/media.m`: media classification and native image, AVKit video, and PDFKit viewer windows.
 - `src/session.rs`: bounded, atomic preferences storage, including non-UTF-8 paths.
 - `src/icons.rs`: embedded SVG icon assets.
 - `tests/operations.rs`: native filesystem integration tests.
+- `tests/jobs.rs`: isolated transfer retry and Trash worker regressions.
 - `tests/gpui/`: rendered GPUI event regression suite.
 - `.github/workflows/macos.yml`: macOS checks, tests, and a downloadable app archive.
 
